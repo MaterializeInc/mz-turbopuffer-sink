@@ -14,6 +14,7 @@ import time
 import pytest
 from harness import (
     API_KEY,
+    namespace_for,
     REGION,
     REPO,
     STRONG,
@@ -36,7 +37,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def namespace_name():
-    return f"mz-tpuf-e2e-transform-{int(time.time())}"
+    return namespace_for("transform")
 
 
 @pytest.fixture(scope="module")

@@ -16,6 +16,7 @@ import time
 import pytest
 from harness import (
     API_KEY,
+    namespace_for,
     BOOTSTRAP,
     REGION,
     REPO,
@@ -40,8 +41,8 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def namespace_name():
-    # unique per run so a rerun never inherits state
-    return f"mz-tpuf-e2e-{int(time.time())}"
+    # unique per run so a rerun, or a concurrent CI run, never shares state
+    return namespace_for("products")
 
 
 @pytest.fixture(scope="module")

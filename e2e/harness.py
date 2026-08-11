@@ -6,6 +6,7 @@ import os
 import pathlib
 import subprocess
 import time
+import uuid
 
 import psycopg
 from dotenv import load_dotenv
@@ -23,6 +24,17 @@ STRONG = {"level": "strong"}
 
 API_KEY = os.environ.get("MZ_TPUF_TURBOPUFFER_API_KEY")
 REGION = os.environ.get("MZ_TPUF_TURBOPUFFER_REGION", "aws-us-east-1")
+
+
+def namespace_for(scenario: str) -> str:
+    """A namespace name unique to this run.
+
+    Concurrent CI runs would otherwise collide on a second-resolution
+    timestamp and write into each other's namespace. MZ_TPUF_E2E_PREFIX lets
+    CI tag every namespace it creates so a cancelled run can be cleaned up.
+    """
+    prefix = os.environ.get("MZ_TPUF_E2E_PREFIX", "local")
+    return f"mz-tpuf-e2e-{prefix}-{scenario}-{uuid.uuid4().hex[:8]}"
 
 
 def compose(*args: str, check: bool = True) -> subprocess.CompletedProcess:

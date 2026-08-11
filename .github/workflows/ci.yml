@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        # pinned exactly: setup-uv publishes no floating v9 major tag
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run unit tests
+        run: uv run pytest -q
+
+  e2e:
+    name: End-to-end tests
+    runs-on: ubuntu-latest
+    # Docker images, Materialize startup, and two full scenarios against real
+    # turbopuffer; a comfortable ceiling rather than a target.
+    timeout-minutes: 25
+    env:
+      MZ_TPUF_TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_API_KEY }}
+      MZ_TPUF_TURBOPUFFER_REGION: ${{ vars.TURBOPUFFER_REGION || 'aws-us-east-1' }}
+      # tags every namespace this run creates, so cleanup can find them again
+      MZ_TPUF_E2E_PREFIX: ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        # pinned exactly: setup-uv publishes no floating v9 major tag
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Report whether turbopuffer credentials are available
+        run: |
+          if [ -n "$MZ_TPUF_TURBOPUFFER_API_KEY" ]; then
+            echo "turbopuffer key present; end-to-end tests will run"
+          else
+            # secrets are not exposed to pull requests from forks
+            echo "::warning::No TURBOPUFFER_API_KEY secret available; the" \
+                 "end-to-end tests will be skipped. This is expected for pull" \
+                 "requests from forks."
+          fi
+
+      - name: Pull container images
+        run: docker compose -f e2e/docker-compose.yml pull --quiet
+
+      - name: Run end-to-end tests
+        run: uv run pytest e2e -v -s
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose -f e2e/docker-compose.yml logs --no-color --tail=200
+
+      - name: Tear down containers
+        if: always()
+        run: docker compose -f e2e/docker-compose.yml down -v
+
+      - name: Delete any namespaces this run left behind
+        if: always()
+        run: uv run python e2e/cleanup_namespaces.py
