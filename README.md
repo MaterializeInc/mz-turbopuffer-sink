@@ -1,276 +1,159 @@
 # mz-tpuf-sink
 
-Atomically sink a [Materialize](https://materialize.com) Kafka sink topic into
-[turbopuffer](https://turbopuffer.com).
+Keep a [turbopuffer](https://turbopuffer.com) namespace in sync with a
+[Materialize](https://materialize.com) view.
 
-Materialize stamps every message it emits with a `materialize-timestamp`
-header; all messages sharing a timestamp were committed atomically in one
-Materialize transaction. This service reconstructs those transactions from the
-topic and applies each one as **a single atomic turbopuffer write request**:
+Materialize maintains your view incrementally as the underlying data changes.
+This project mirrors that view into turbopuffer, so a namespace you search
+against is always a current reflection of a query you already trust — no
+rebuild job, no nightly reindex, no drift between the two.
 
-- **insert** (`before: null`) → full-row upsert
-- **update** (`before` + `after`) → **column-level patch** containing only the
-  columns that actually changed
-- **delete** (`after: null`) → delete by ID
+Point it at a Materialize sink and leave it running.
 
-It is generic over the schema: the topic must be `FORMAT AVRO` with
-`ENVELOPE DEBEZIUM` (and a single-column `KEY`), registered in a
-Confluent-compatible Schema Registry. Every Avro field maps to a turbopuffer
-attribute.
-
-## Packages
-
-This repository is a uv workspace holding two distributions:
-
-| Package | What it is |
-| --- | --- |
-| [`packages/mz-tpuf-sink`](packages/mz-tpuf-sink) | The library. Exposes `SinkConfig` and `run_sink(config, stop=None)` — no CLI, no environment reading. |
-| [`packages/mz-tpuf-sink-cli`](packages/mz-tpuf-sink-cli) | A thin wrapper providing the `mz-tpuf-sink` command: loads `MZ_TPUF_*` settings, sets up logging and signal handlers, calls `run_sink`. |
-
-Embedding it in your own process:
-
-```python
-from mz_tpuf_sink import SinkConfig, run_sink
-
-run_sink(SinkConfig(
-    kafka_bootstrap_servers="localhost:9092",
-    kafka_topic="events",
-    schema_registry_url="http://localhost:8081",
-    materialize_dsn="postgres://materialize@localhost:6875/materialize",
-    materialize_sink="materialize.public.events_sink",
-    turbopuffer_api_key="tpuf_...",
-    turbopuffer_region="aws-us-east-1",
-    namespace="events",
-))
+```sh
+git clone https://github.com/MaterializeInc/mz-turbopuffer-sink
+cd mz-turbopuffer-sink && uv sync
+uv run mz-tpuf-sink
 ```
 
-`run_sink` blocks; pass a `threading.Event` as `stop` to shut it down from
-another thread. The library deliberately does not read the environment,
-configure logging, or install signal handlers — those are the caller's to own,
-which is exactly what the CLI package supplies.
+## What it gives you
 
-**Transforms** derive extra attributes — an embedding, typically — from a
-record's columns, and run after the diff so an unrelated update never pays to
-recompute one:
+**Transactions arrive whole.** A statement that changes fifty rows shows up in
+turbopuffer as fifty changed documents at once. A search never sees half of an
+update.
+
+**Updates touch only what changed.** Changing a price rewrites the price and
+leaves the document's other attributes alone — including any you wrote yourself,
+outside this sink.
+
+**Deletes propagate.** A row that leaves the view leaves the namespace.
+
+**Your schema comes across on its own.** Column types are read from the sink
+and declared to turbopuffer, so numbers stay numbers and timestamps stay
+timestamps, filterable and sortable. There is no mapping file to maintain, and
+adding a column to your view needs no change here.
+
+**Embeddings stay fresh without being recomputed.** See below.
+
+## Embeddings
+
+The reason to put a view in turbopuffer is usually vector search, and the
+expensive part of vector search is embedding. A **transform** computes derived
+attributes from a record's columns — and only runs when the columns it reads
+actually change.
 
 ```python
-run_sink(config, transforms=[embedding])
+from mz_tpuf_sink import FunctionTransform, SinkConfig, run_sink
+from openai import OpenAI
+
+client = OpenAI()
+
+def embed(rows):
+    """Called once per batch of records, never once per row."""
+    text = [f"{row['title']}\n\n{row['description']}" for row in rows]
+    response = client.embeddings.create(model="text-embedding-3-small", input=text)
+    return [{"embedding": item.embedding} for item in response.data]
+
+article_embedding = FunctionTransform(
+    name="article_embedding",
+    sources=("title", "description"),                       # columns it reads
+    schema={"embedding": {"type": "[1536]f32", "ann": True}},
+    distance_metric="cosine_distance",
+    batch_size=256,
+    compute=embed,
+)
+
+run_sink(
+    SinkConfig(
+        kafka_bootstrap_servers="localhost:9092",
+        kafka_topic="articles",
+        schema_registry_url="http://localhost:8081",
+        materialize_dsn="postgres://materialize@localhost:6875/materialize",
+        materialize_sink="materialize.public.articles_sink",
+        turbopuffer_api_key="tpuf_...",
+        turbopuffer_region="aws-us-east-1",
+        namespace="articles",
+    ),
+    transforms=[article_embedding],
+)
 ```
 
-See the [library README](packages/mz-tpuf-sink#transforms-derived-attributes-and-embeddings)
-for the contract and the turbopuffer vector constraints. Transforms are code, so
-the CLI cannot supply them; use the library directly.
+Edit an article's `title` and it is re-embedded. Change its `view_count` a
+thousand times and it is not embedded once. That distinction is the whole
+point: the embedding bill tracks edits to the text, not writes to the table.
 
-## Requirements
+A transform is ordinary Python, so it can call any model, local or hosted, and
+it receives records in batches so one API call covers many documents. It can
+produce anything, not just vectors — a slug, a sentiment score, a translated
+title.
 
-- Python ≥ 3.12, [uv](https://docs.astral.sh/uv/)
-- A Materialize sink like:
+One wrinkle worth knowing: turbopuffer does not allow a vector to be modified
+in place, so a record whose embedding is recomputed is rewritten in full. For
+those records — and only those — attributes you added to the document outside
+this sink are replaced rather than preserved.
+
+Transforms are code rather than configuration, so they need the library. The
+command-line runner covers everything else.
+
+## What you need
+
+- **A Materialize sink** publishing the view you want mirrored:
 
   ```sql
-  CREATE SINK events_sink
-    FROM my_view
-    INTO KAFKA CONNECTION kafka_conn (TOPIC 'events')
+  CREATE SINK articles_sink
+    FROM articles_view
+    INTO KAFKA CONNECTION kafka_conn (TOPIC 'articles')
     KEY (id)
     FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY CONNECTION csr_conn
     ENVELOPE DEBEZIUM;
   ```
 
-  Configure it as `MZ_TPUF_MATERIALIZE_SINK=materialize.public.events_sink`.
-  The sink is looked up by database, schema, name, **and** topic, so a name
-  that resolves to a sink writing somewhere else fails at startup instead of
-  tracking the wrong frontier.
+  `KEY` must name exactly one column, and its value becomes the turbopuffer
+  document id. Integers, strings up to 64 bytes, and UUIDs all work.
 
-- A SQL connection to the same Materialize instance (used only to `SUBSCRIBE`
-  to the sink's write frontier).
+- **A connection to that Materialize instance**, so the sink knows when a
+  transaction is complete.
 
-## Running
+- **A turbopuffer API key**, and Python 3.12+.
 
-```sh
-uv sync
-uv run mz-tpuf-sink
-```
+Run one process per topic, writing to one namespace.
 
-Configuration comes from `MZ_TPUF_*` environment variables or a `.env` file;
-the full table lives in the
-[CLI package README](packages/mz-tpuf-sink-cli/README.md).
+## What your columns become
 
-Run **one process per topic**, one topic per namespace.
-
-## How it works
-
-```
-Kafka consumer ──▶ Avro/Debezium decoder ──▶ TransactionBuffer (by ts)
-                                                   │  flush when complete
-mz SUBSCRIBE mz_frontiers ──▶ FrontierWatcher ─────┘
-                                                   ▼
-                                  one atomic turbopuffer write per ts
-                                                   ▼
-                                        commit Kafka offsets
-```
-
-**Transaction completeness.** Within a partition, Materialize emits messages
-in non-decreasing timestamp order. A timestamp `T` is complete once every
-assigned partition has either (a) yielded a message with `ts > T`, or (b) been
-consumed to its high watermark while the Materialize sink's *write frontier*
-(observed via one long-lived
-`SUBSCRIBE (... mz_internal.mz_frontiers JOIN mz_sinks ...)`) has passed `T`.
-Rule (b) is what makes idle partitions and quiet topics deterministic — no
-flush-timeout heuristics.
-
-**Backpressure.** A partition may read the oldest unflushed timestamp plus one
-timestamp ahead; beyond that it is `pause()`d until the writer catches up, so
-memory is bounded by roughly two transactions per partition.
-
-## Delivery semantics
-
-- **At-least-once, effectively exactly-once for state.** Offsets are committed
-  only after the transaction is written. On restart, replayed messages
-  re-issue the same upserts/patches/deletes, which are idempotent.
-- **Atomicity.** One Materialize timestamp = one turbopuffer write request,
-  which turbopuffer applies atomically. The exception is a transaction larger
-  than the configured request limits (notably the initial snapshot): it is
-  split into sequential requests and readers may briefly observe a partial
-  state for *that timestamp only*; offsets still commit only after the last
-  chunk.
-- **Single writer.** Run one instance per consumer group/namespace. turbopuffer
-  has no request-level compare-and-swap, so concurrent writers to the same
-  namespace are not fenced.
-- **Committed records only.** Materialize writes its sink topic using Kafka
-  transactions, so the consumer pins `isolation.level=read_committed` and never
-  applies records from aborted transactions. (librdkafka already defaults to
-  `read_committed`, unlike the Java client, but the sink sets it explicitly
-  rather than depending on that.)
-- On rebalance, all buffered state is dropped and uncommitted messages are
-  redelivered, so a stale consumer can never overwrite newer writes.
-
-## Data mapping
-
-| Source | turbopuffer |
+| Materialize | turbopuffer |
 | --- | --- |
-| Kafka key: `int`/`long` column | `uint` ID (negative values are an error) |
-| Kafka key: `string` column | `string` ID, verbatim (max 64 bytes) |
-| Kafka key: `uuid` logical type | `uuid` ID |
-| `timestamp`/`timestamptz`/`date` | `datetime` (sent as ISO-8601) |
-| `time` | `int` (Materialize sends an untagged microsecond count) |
-| `interval` | base64 `string` (Avro `fixed`) |
-| `decimal` | `float` |
-| `float`/`double` | `float` |
-| `int`/`long` | `int` |
+| `text` | `string` |
+| `int`, `bigint` | `int` |
+| `numeric`, `float`, `double` | `float` — range filters and sorting work |
 | `boolean` | `bool` |
-| `bytes` | base64 `string` |
-| nested records / maps | JSON `string` |
-| arrays of primitives | `[]string` / `[]int` / `[]float` / … |
-| arrays of records | JSON `string` |
+| `timestamp`, `timestamptz`, `date` | `datetime` |
+| `time` | `int` (microseconds since midnight) |
+| `bytea`, `interval` | base64 `string` |
+| lists | `[]string`, `[]int`, `[]float`, … |
+| records, maps, lists of records | JSON `string` |
 
-A value column named `id` is not treated as an attribute; the document ID
-always comes from the Kafka key. The sink logs a warning once if a value
-column named `id` is dropped because the key column has a different name.
+A namespace holds at most two vector attributes, and a vector needs both
+`ann: True` and a `distance_metric`.
 
-### The sink's KEY must be one column
+## Packages
 
-A turbopuffer document id is a single value, and this sink never invents an
-encoding for one. The key is used verbatim, so:
-
-- **`KEY` must name exactly one column.** A composite key is rejected at
-  startup. If you need one, derive a single key column in the upstream view
-  and sink that.
-- **A string key over 64 bytes is an error**, not a hash. Hashing would put
-  two encodings into one id space, where a short key can equal another key's
-  hash and the two rows would silently share — and overwrite — one document.
-  Shorten the key upstream instead; sinking a hashed key column from the view
-  makes the choice explicit and visible in your schema.
-- **A negative integer key is an error**, since turbopuffer's numeric ids are
-  unsigned.
-
-These are startup or per-record failures on purpose: the sink stops rather
-than writing a document whose identity it cannot guarantee is unique. Note a
-per-record failure is a poison message — the sink exits, and on restart it
-replays the same record and exits again — so an over-long key needs an
-upstream fix, not a retry.
-
-`numeric` becomes a turbopuffer `float`, so range filters and sorting work
-(`["price", "Gt", 10]`). Materialize encodes unconstrained `numeric` as an Avro
-decimal with scale 39, so `9.99` arrives as
-`9.990000000000000000000000000000000000000`; the float conversion drops that
-padding. Values carrying more than 17 significant digits cannot round-trip
-through a float, and the sink warns once when it sees one.
-
-### Attribute schema is declared, not inferred
-
-On startup the sink reads the topic's registered Avro value schema and derives
-an explicit turbopuffer attribute schema from it (logged at INFO), which it
-sends with every write. The document `id` type is declared too, so a UUID key
-is stored as a UUID rather than inferred as a string.
-
-This is not an optimization — it is required for correctness. turbopuffer
-otherwise infers each attribute's type from the first value it sees, and an
-integral float is indistinguishable from an integer on the wire: a first row
-with `price = 5.00` pins the attribute to `int`, and the next row's `9.99` is
-then rejected with `number cannot be represented as signed 64-bit integer`,
-stalling the sink. Declaring the type up front also fixes columns whose first
-observed value is `NULL`, which offer nothing to infer from.
-
-## Continuous integration
-
-`.github/workflows/ci.yml` runs on every pull request and on pushes to `main`:
-the unit suite, and the end-to-end suite driving Materialize and Redpanda in
-Docker against real turbopuffer.
-
-The end-to-end job needs a **`TURBOPUFFER_API_KEY` repository secret**; the key
-is never committed, and `e2e/.env` stays gitignored for local runs. Optionally
-set a `TURBOPUFFER_REGION` repository variable (it defaults to
-`aws-us-east-1`). GitHub does not expose secrets to pull requests from forks,
-so there the end-to-end tests skip themselves and the job annotates why rather
-than failing.
-
-Each run tags the namespaces it creates with its run id, so a cancelled job
-cannot orphan them — a cleanup step deletes anything carrying that tag.
+| Package | Use it when |
+| --- | --- |
+| [`mz-tpuf-sink`](packages/mz-tpuf-sink) | You want embeddings or other transforms, or you are embedding the sink in your own process. Exposes `SinkConfig` and `run_sink`. |
+| [`mz-tpuf-sink-cli`](packages/mz-tpuf-sink-cli) | You want to run it as a service. Provides the `mz-tpuf-sink` command, configured entirely through `MZ_TPUF_*` environment variables — the [full list is here](packages/mz-tpuf-sink-cli/README.md). |
 
 ## Development
 
 ```sh
-uv run pytest          # unit tests only; no Docker, no network
+uv sync
+uv run pytest              # unit tests: no Docker, no network
+uv run pytest e2e -v -s    # full pipeline against real turbopuffer
 ```
 
-Both packages' tests run from the workspace root. The library suite covers the
-completeness rule, backpressure, per-key merging, Debezium diffing, ID
-derivation, schema derivation, chunking, and retry behavior; one test drives
-the real turbopuffer SDK client over a mock HTTP transport so the request shape
-and URL routing are checked without network access. The CLI suite covers
-environment loading, `.env` handling, and that a signal requests a clean
-shutdown.
+The end-to-end suite needs Docker and a turbopuffer key in `e2e/.env`
+(gitignored); it creates throwaway namespaces and deletes them afterwards, and
+skips itself when no key is present.
 
-To work on one package alone, `uv run --package mz-tpuf-sink pytest
-packages/mz-tpuf-sink/tests`.
-
-### End-to-end test
-
-`e2e/` runs the whole pipeline — Materialize → Redpanda (Kafka + Schema
-Registry) → this sink → **real turbopuffer**:
-
-```sh
-echo 'MZ_TPUF_TURBOPUFFER_API_KEY=tpuf_...' > e2e/.env   # gitignored
-echo 'MZ_TPUF_TURBOPUFFER_REGION=aws-us-east-1'         >> e2e/.env
-uv run pytest e2e -v -s
-```
-
-It needs Docker, takes about 45 seconds, and is skipped if no API key is
-present. It writes to a throwaway namespace (`mz-tpuf-e2e-<timestamp>`) and
-deletes it afterwards, so it cannot touch existing data.
-
-The topic is deliberately created with **3 partitions** while the test uses
-only a few keys, so at least one partition stays empty — that is what
-exercises frontier-based settlement for idle partitions. The scenario asserts:
-
-1. A multi-row insert lands with correct type mapping.
-2. An update is a genuine **column-level patch**: the test writes a `sidecar`
-   attribute directly to turbopuffer that Materialize knows nothing about, then
-   updates one column and asserts the sidecar survived. A full-row upsert would
-   have destroyed it.
-3. A delete removes exactly one document.
-4. A statement touching two rows produces **one** turbopuffer request carrying
-   two operations (asserted against the sink's own log).
-5. An insert after an idle period still lands promptly, proving empty and idle
-   partitions settle rather than stalling the sink.
-6. Offsets are actually committed to Kafka, so a restart resumes instead of
-   replaying the topic.
+CI runs both suites on every pull request. The end-to-end job reads a
+`TURBOPUFFER_API_KEY` repository secret, which GitHub does not expose to pull
+requests from forks — those runs skip the end-to-end tests rather than failing.
