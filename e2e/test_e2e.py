@@ -89,6 +89,10 @@ def mz_exec(*statements: str) -> None:
 
 @pytest.fixture(scope="module")
 def infra():
+    # Start from a guaranteed-clean slate: a previous run killed mid-flight
+    # leaves the stack up, and the topic and Materialize objects created below
+    # would then already exist.
+    compose("down", "-v", check=False)
     compose("up", "-d", "--wait")
     try:
         wait_for(
