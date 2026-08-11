@@ -9,9 +9,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  UV_FROZEN: "1"
-
 jobs:
   unit:
     name: Unit tests
@@ -31,7 +28,7 @@ jobs:
         run: uv sync --locked
 
       - name: Run unit tests
-        run: uv run pytest -q
+        run: uv run --no-sync pytest -q
 
   e2e:
     name: End-to-end tests
@@ -72,7 +69,7 @@ jobs:
         run: docker compose -f e2e/docker-compose.yml pull --quiet
 
       - name: Run end-to-end tests
-        run: uv run pytest e2e -v -s
+        run: uv run --no-sync pytest e2e -v -s
 
       - name: Show container logs on failure
         if: failure()
@@ -84,4 +81,4 @@ jobs:
 
       - name: Delete any namespaces this run left behind
         if: always()
-        run: uv run python e2e/cleanup_namespaces.py
+        run: uv run --no-sync python e2e/cleanup_namespaces.py
