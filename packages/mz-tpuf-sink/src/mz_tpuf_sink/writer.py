@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Iterator
 
 import turbopuffer
 
@@ -51,12 +51,24 @@ class Writer:
         self._initial_backoff = initial_backoff
         self._sleep = sleep
 
-    def write_transaction(self, ops: list[Op]) -> None:
+    def write_transaction(self, ops: Iterable[Op]) -> None:
+        """Write one transaction, chunking if it exceeds the request limits.
+
+        `ops` may be a generator: chunks are written as they are filled, so a
+        transaction carrying embedding vectors never has to be held whole in
+        memory.
+        """
+        written = 0
         for chunk in self._chunk(ops):
             self._write_chunk(chunk)
+            written += 1
+            if written == 2:
+                logger.warning(
+                    "transaction split across multiple requests; "
+                    "atomicity is per-request"
+                )
 
-    def _chunk(self, ops: list[Op]) -> list[list[Op]]:
-        chunks: list[list[Op]] = []
+    def _chunk(self, ops: Iterable[Op]) -> Iterator[list[Op]]:
         current: list[Op] = []
         current_bytes = 0
         for op in ops:
@@ -65,18 +77,12 @@ class Writer:
                 len(current) >= self._max_rows
                 or current_bytes + size > self._max_bytes
             ):
-                chunks.append(current)
+                yield current
                 current, current_bytes = [], 0
             current.append(op)
             current_bytes += size
         if current:
-            chunks.append(current)
-        if len(chunks) > 1:
-            logger.warning(
-                "transaction split into %d requests; atomicity is per-request",
-                len(chunks),
-            )
-        return chunks
+            yield current
 
     def _write_chunk(self, ops: list[Op]) -> None:
         request: dict[str, Any] = {}

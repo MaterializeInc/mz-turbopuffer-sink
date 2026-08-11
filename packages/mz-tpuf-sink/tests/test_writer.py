@@ -115,6 +115,61 @@ class TestChunking:
         assert len(client.requests) == 1
 
 
+class TestStreaming:
+    """Transformed ops carry embedding vectors, so the writer must never hold a
+    whole transaction in memory — it consumes an iterable one chunk at a time."""
+
+    def test_accepts_a_generator(self):
+        client = FakeClient()
+        ops = (Upsert(id=i, row={"id": i}) for i in range(3))
+        make_writer(client).write_transaction(ops)
+        assert len(client.requests[0]["upsert_rows"]) == 3
+
+    def test_never_reads_more_than_one_chunk_ahead(self):
+        client = FakeClient()
+        pulled = []
+
+        def source():
+            for i in range(10):
+                pulled.append(i)
+                yield Upsert(id=i, row={"id": i})
+
+        writer = make_writer(client, max_rows_per_request=2)
+        original = writer._write_chunk
+        depth = []
+
+        def recording_write_chunk(chunk):
+            # how many ops have been pulled at the moment a request is issued
+            depth.append(len(pulled))
+            return original(chunk)
+
+        writer._write_chunk = recording_write_chunk
+        writer.write_transaction(source())
+
+        # with a chunk size of 2, issuing request N must have pulled at most
+        # 2*N + 1 ops (the +1 is the lookahead that closes the chunk)
+        assert all(d <= 2 * (n + 1) + 1 for n, d in enumerate(depth)), depth
+        assert len(client.requests) == 5
+
+    def test_split_warning_fires_once_per_transaction(self, caplog):
+        import logging
+
+        client = FakeClient()
+        ops = [Upsert(id=i, row={"id": i}) for i in range(5)]
+        with caplog.at_level(logging.WARNING):
+            make_writer(client, max_rows_per_request=2).write_transaction(ops)
+        warnings = [r for r in caplog.records if "split" in r.message]
+        assert len(warnings) == 1
+
+    def test_no_split_warning_for_a_single_chunk(self, caplog):
+        import logging
+
+        client = FakeClient()
+        with caplog.at_level(logging.WARNING):
+            make_writer(client).write_transaction([Upsert(id=1, row={"id": 1})])
+        assert [r for r in caplog.records if "split" in r.message] == []
+
+
 class TestRetries:
     def test_retries_429_then_succeeds(self):
         sleeps = []
