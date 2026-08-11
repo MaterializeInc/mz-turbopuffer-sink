@@ -1,0 +1,110 @@
+import base64
+import datetime as dt
+from decimal import Decimal
+
+import pytest
+
+from mz_tpuf_sink.ids import IdCodec
+from mz_tpuf_sink.models import ChangeEvent, Delete, Patch, Upsert
+from mz_tpuf_sink.translate import Translator, to_attr
+
+
+def make_codec():
+    return IdCodec.from_key_schema(
+        {"type": "record", "name": "k", "fields": [{"name": "id", "type": "long"}]}
+    )
+
+
+def event(before, after, key=None):
+    return ChangeEvent(
+        key=key or {"id": 1},
+        before=before,
+        after=after,
+        ts=100,
+        partition=0,
+        offset=0,
+    )
+
+
+class TestEnvelopeTranslation:
+    def setup_method(self):
+        self.translator = Translator(make_codec())
+
+    def test_insert_becomes_full_upsert(self):
+        op = self.translator.translate(event(None, {"id": 1, "name": "a", "n": 2}))
+        assert op == Upsert(id=1, row={"id": 1, "name": "a", "n": 2})
+
+    def test_update_becomes_patch_of_changed_columns_only(self):
+        op = self.translator.translate(
+            event({"id": 1, "name": "a", "n": 2}, {"id": 1, "name": "b", "n": 2})
+        )
+        assert op == Patch(id=1, columns={"name": "b"})
+
+    def test_update_setting_column_to_null_patches_null(self):
+        op = self.translator.translate(
+            event({"id": 1, "name": "a"}, {"id": 1, "name": None})
+        )
+        assert op == Patch(id=1, columns={"name": None})
+
+    def test_update_with_no_changes_returns_none(self):
+        op = self.translator.translate(event({"id": 1, "n": 2}, {"id": 1, "n": 2}))
+        assert op is None
+
+    def test_delete_becomes_delete_by_id(self):
+        op = self.translator.translate(event({"id": 1, "name": "a"}, None))
+        assert op == Delete(id=1)
+
+    def test_empty_envelope_is_an_error(self):
+        with pytest.raises(ValueError, match="before.*after"):
+            self.translator.translate(event(None, None))
+
+    def test_id_column_never_patched(self):
+        # doc id comes from the key; the value's own "id" column is not an attribute
+        op = self.translator.translate(event({"id": 1, "n": 2}, {"id": 1, "n": 3}))
+        assert op == Patch(id=1, columns={"n": 3})
+
+
+class TestTypeMapping:
+    def test_datetime_maps_to_iso_string(self):
+        value = dt.datetime(2026, 8, 11, 12, 0, 0, tzinfo=dt.timezone.utc)
+        assert to_attr(value) == "2026-08-11T12:00:00+00:00"
+
+    def test_date_maps_to_iso_string(self):
+        assert to_attr(dt.date(2026, 8, 11)) == "2026-08-11"
+
+    def test_decimal_maps_to_string(self):
+        assert to_attr(Decimal("1.50")) == "1.50"
+
+    def test_bytes_map_to_base64_string(self):
+        assert to_attr(b"\x00\x01") == base64.b64encode(b"\x00\x01").decode()
+
+    def test_nested_record_maps_to_json_string(self):
+        assert to_attr({"a": 1, "b": "x"}) == '{"a":1,"b":"x"}'
+
+    def test_list_of_primitives_passes_through(self):
+        assert to_attr([1, 2, 3]) == [1, 2, 3]
+
+    def test_list_of_records_maps_to_json_string(self):
+        assert to_attr([{"a": 1}]) == '[{"a":1}]'
+
+    def test_primitives_pass_through(self):
+        assert to_attr("x") == "x"
+        assert to_attr(3) == 3
+        assert to_attr(1.5) == 1.5
+        assert to_attr(True) is True
+        assert to_attr(None) is None
+
+    def test_upsert_rows_have_mapped_values(self):
+        translator = Translator(make_codec())
+        ts = dt.datetime(2026, 8, 11, tzinfo=dt.timezone.utc)
+        op = translator.translate(event(None, {"id": 1, "created": ts}))
+        assert op == Upsert(id=1, row={"id": 1, "created": "2026-08-11T00:00:00+00:00"})
+
+    def test_diff_compares_raw_values_before_mapping(self):
+        # equal datetimes must not produce a patch even though mapping changes repr
+        translator = Translator(make_codec())
+        ts = dt.datetime(2026, 8, 11, tzinfo=dt.timezone.utc)
+        op = translator.translate(
+            event({"id": 1, "created": ts}, {"id": 1, "created": ts})
+        )
+        assert op is None
