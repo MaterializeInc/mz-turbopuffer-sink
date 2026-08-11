@@ -210,6 +210,22 @@ then rejected with `number cannot be represented as signed 64-bit integer`,
 stalling the sink. Declaring the type up front also fixes columns whose first
 observed value is `NULL`, which offer nothing to infer from.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request and on pushes to `main`:
+the unit suite, and the end-to-end suite driving Materialize and Redpanda in
+Docker against real turbopuffer.
+
+The end-to-end job needs a **`TURBOPUFFER_API_KEY` repository secret**; the key
+is never committed, and `e2e/.env` stays gitignored for local runs. Optionally
+set a `TURBOPUFFER_REGION` repository variable (it defaults to
+`aws-us-east-1`). GitHub does not expose secrets to pull requests from forks,
+so there the end-to-end tests skip themselves and the job annotates why rather
+than failing.
+
+Each run tags the namespaces it creates with its run id, so a cancelled job
+cannot orphan them — a cleanup step deletes anything carrying that tag.
+
 ## Development
 
 ```sh
