@@ -19,22 +19,17 @@ run_sink(SinkConfig(...))   # blocks until stopped
 
 ## What it gives you
 
-**Transactions arrive whole.** A statement that changes fifty rows shows up in
-turbopuffer as fifty changed documents at once. A search never sees half of an
-update.
+Transactions arrive whole. Materialize commits a batch of changes at a single
+timestamp, and the sink applies that timestamp to turbopuffer as one write. A
+statement that changes fifty rows shows up as fifty changed documents at once,
+and a row that leaves the view leaves the namespace. A search never sees half of
+an update.
 
-**Updates touch only what changed.** Changing a price rewrites the price and
-leaves the document's other attributes alone.
-
-**Deletes propagate.** A row that leaves the view leaves the namespace.
-
-**Your schema comes across on its own.** Column types are read from the Avro
-schema the sink publishes to Schema Registry and declared to turbopuffer, so
-numbers stay numbers and timestamps stay timestamps, filterable and sortable.
-There is no mapping file to maintain, and adding a column to your view needs no
-change here.
-
-**Embeddings are recomputed only when the text behind them changes.**
+Embeddings are recomputed only when their text changes. The sink sees which
+columns moved in each record, so it re-embeds the records whose source text
+changed and leaves every other vector alone. Edit an article's `title` and it is
+re-embedded; change its `view_count` a thousand times and it is not embedded
+once. The bill tracks edits to the text rather than writes to the table.
 
 ## Embeddings
 
@@ -79,10 +74,6 @@ run_sink(
 )
 ```
 
-Edit an article's `title` and it is re-embedded. Change its `view_count` a
-thousand times and it is not embedded once, so the embedding bill tracks edits
-to the text rather than writes to the table.
-
 Each row handed to `compute` holds exactly the columns named in `sources`, plus
 `id`. Return one mapping per row, in the same order, containing the attributes
 named in `schema`.
@@ -116,6 +107,11 @@ title.
 Run one process per topic, writing to one namespace.
 
 ## Type mapping
+
+Column types are read from the Avro schema the sink publishes to Schema
+Registry and declared to turbopuffer, so numbers stay numbers and timestamps
+stay timestamps, filterable and sortable. There is no mapping file to maintain,
+and adding a column to your view needs no change here.
 
 | Materialize | turbopuffer |
 | --- | --- |
