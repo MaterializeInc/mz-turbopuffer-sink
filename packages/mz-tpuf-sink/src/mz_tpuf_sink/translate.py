@@ -64,6 +64,7 @@ class Translator:
         self,
         codec: IdCodec,
         retain_groups: Sequence[frozenset[str]] = (),
+        full_row_triggers: frozenset[str] = frozenset(),
     ):
         """`retain_groups` are sets of columns that must travel together.
 
@@ -72,10 +73,22 @@ class Translator:
         group changes the rest of that group is retained from `after`. Groups
         of one are dropped: that column is already in the patch whenever it
         matters, so the common case costs nothing.
+
+        `full_row_triggers` are columns feeding a transform that produces a
+        vector. turbopuffer cannot patch a vector, so an update touching one of
+        these is written as a whole-document upsert instead. Updates that miss
+        them stay patches, and the stored vector is left untouched — which is
+        what keeps an unrelated update from paying for a re-embed.
         """
         self._codec = codec
         self._retain_groups = tuple(g for g in retain_groups if len(g) > 1)
+        self._full_row_triggers = frozenset(full_row_triggers)
         self._warned_id_column = False
+
+    def _full_row(self, doc_id: Any, after: dict[str, Any]) -> Upsert:
+        row = {"id": doc_id}
+        row.update((f, to_attr(v)) for f, v in after.items() if f != "id")
+        return Upsert(id=doc_id, row=row)
 
     def _warn_dropped_id(self, row: dict[str, Any]) -> None:
         # "id" is turbopuffer's reserved document-ID field; a value column
@@ -94,11 +107,7 @@ class Translator:
         doc_id = self._codec.encode(event.key)
 
         if event.after is not None and event.before is None:
-            row = {"id": doc_id}
-            row.update(
-                (f, to_attr(v)) for f, v in event.after.items() if f != "id"
-            )
-            return Upsert(id=doc_id, row=row)
+            return self._full_row(doc_id, event.after)
 
         if event.after is not None and event.before is not None:
             changed = {
@@ -108,6 +117,10 @@ class Translator:
             }
             if not changed:
                 return None
+            if self._full_row_triggers & set(changed):
+                # a vector must be rewritten wholesale, and an upsert replaces
+                # the document, so it has to carry every column
+                return self._full_row(doc_id, event.after)
             # snapshot before retaining: otherwise retaining a column for one
             # group would trigger any other group containing it, and each
             # spurious trigger is a paid transform call downstream

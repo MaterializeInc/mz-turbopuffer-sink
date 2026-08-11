@@ -36,6 +36,7 @@ class Writer:
         *,
         namespace: str,
         schema: dict[str, Any] | None = None,
+        distance_metric: str | None = None,
         max_rows_per_request: int = 10_000,
         max_bytes_per_request: int = 200 * 1024 * 1024,
         max_attempts: int = 5,
@@ -45,6 +46,7 @@ class Writer:
         self._client = client
         self._namespace = namespace
         self._schema = schema
+        self._distance_metric = distance_metric
         self._max_rows = max_rows_per_request
         self._max_bytes = max_bytes_per_request
         self._max_attempts = max_attempts
@@ -97,6 +99,10 @@ class Writer:
             request["deletes"] = deletes
         if self._schema:
             request["schema"] = self._schema
+        if self._distance_metric:
+            # required by turbopuffer on every write once the namespace holds a
+            # vector attribute
+            request["distance_metric"] = self._distance_metric
 
         backoff = self._initial_backoff
         for attempt in range(1, self._max_attempts + 1):

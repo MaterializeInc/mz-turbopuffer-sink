@@ -26,6 +26,8 @@ testpaths = ["packages/mz-tpuf-sink/tests", "packages/mz-tpuf-sink-cli/tests"]
 # each package has its own tests/ directory; importlib mode keeps same-named
 # test modules in different packages from colliding
 addopts = "--import-mode=importlib"
+# e2e test modules share helpers from e2e/harness.py
+pythonpath = ["e2e"]
 
 [dependency-groups]
 dev = [

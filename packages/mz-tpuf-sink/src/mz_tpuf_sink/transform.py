@@ -39,6 +39,9 @@ class Transform(Protocol):
     sources: tuple[str, ...]
     schema: Mapping[str, Mapping[str, Any]]
     batch_size: int
+    # required when the transform produces a vector: turbopuffer rejects any
+    # write to a namespace holding one unless the request names a metric
+    distance_metric: str | None
 
     def compute(
         self, rows: Sequence[Mapping[str, Any]]
@@ -61,6 +64,7 @@ class FunctionTransform:
     schema: Mapping[str, Mapping[str, Any]]
     compute: Callable[[Sequence[Mapping[str, Any]]], Sequence[Mapping[str, Any]]]
     batch_size: int = field(default=256)
+    distance_metric: str | None = None
 
 
 # ---------------------------------------------------------------- validation
@@ -154,11 +158,15 @@ def validate_transforms(
             if is_vector:
                 vector_attributes += 1
                 if not spec.get("ann"):
-                    logger.warning(
-                        "transform %r attribute %r is a vector without ann=True; "
-                        "it will not be searchable",
-                        transform.name,
-                        attribute,
+                    raise ValueError(
+                        f"transform {transform.name!r} attribute {attribute!r} is a "
+                        f"vector without ann=True, which turbopuffer rejects"
+                    )
+                if not getattr(transform, "distance_metric", None):
+                    raise ValueError(
+                        f"transform {transform.name!r} produces vector "
+                        f"{attribute!r} but sets no distance_metric; turbopuffer "
+                        "requires one on every write to a namespace with a vector"
                     )
             merged[attribute] = spec
 
@@ -167,7 +175,50 @@ def validate_transforms(
             f"{vector_attributes} vector attributes declared; turbopuffer "
             f"namespaces support at most two vector columns"
         )
+    write_distance_metric(transforms)  # rejects conflicting metrics
     return merged
+
+
+def write_distance_metric(transforms: Sequence[Transform]) -> str | None:
+    """The single metric sent with every write, or None without vectors.
+
+    turbopuffer takes one metric per write request, so two vector transforms
+    cannot disagree.
+    """
+    metrics = {
+        t.distance_metric
+        for t in transforms
+        if getattr(t, "distance_metric", None)
+        and any(_VECTOR_TYPE.match(str(s.get("type", ""))) for s in t.schema.values())
+    }
+    if len(metrics) > 1:
+        raise ValueError(
+            "transforms declare conflicting distance_metric values "
+            f"({', '.join(sorted(metrics))}); a turbopuffer write carries one "
+            "metric for the whole namespace"
+        )
+    return metrics.pop() if metrics else None
+
+
+def produces_a_vector(transform: Transform) -> bool:
+    return any(
+        _VECTOR_TYPE.match(str(spec.get("type", "")))
+        for spec in transform.schema.values()
+    )
+
+
+def vector_source_columns(transforms: Sequence[Transform]) -> frozenset[str]:
+    """Columns whose change forces a whole-document upsert.
+
+    turbopuffer cannot patch a vector attribute, so once one of these changes
+    the recomputed vector can only be written by replacing the document.
+    """
+    return frozenset(
+        source
+        for transform in transforms
+        if produces_a_vector(transform)
+        for source in transform.sources
+    )
 
 
 def retain_groups(transforms: Sequence[Transform]) -> list[frozenset[str]]:

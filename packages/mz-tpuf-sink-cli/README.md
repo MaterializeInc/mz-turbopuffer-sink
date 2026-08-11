@@ -43,8 +43,13 @@ working directory:
 | `MZ_TPUF_BUFFER_WARN_BYTES` | | `1 GiB` | Warn when buffered transactions exceed this |
 | `MZ_TPUF_POLL_TIMEOUT` | | `1.0` | Kafka poll timeout (seconds) |
 | `MZ_TPUF_FRONTIER_READY_TIMEOUT` | | `15.0` | Fail startup if no frontier row arrives (wrong sink name) |
+| `MZ_TPUF_KAFKA_MAX_POLL_INTERVAL_MS` | | librdkafka default | Raise when a long-running flush would otherwise evict the consumer |
 
 Run **one process per topic**, one topic per namespace.
+
+This CLI cannot supply transforms (derived attributes such as embeddings),
+because a transform is code rather than configuration. Use the
+[`mz-tpuf-sink`](../mz-tpuf-sink) library directly for those.
 
 See the [repository README](https://github.com/MaterializeInc/mz-turbopuffer-sink)
 for the design and delivery semantics.

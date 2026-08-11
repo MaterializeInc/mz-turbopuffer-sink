@@ -81,9 +81,9 @@ def captured(monkeypatch):
 
     real_translator = runner_module.Translator
 
-    def fake_translator(codec, retain_groups=()):
-        box.translator_args = (codec, list(retain_groups))
-        return real_translator(codec, retain_groups)
+    def fake_translator(codec, retain_groups=(), full_row_triggers=frozenset()):
+        box.translator_args = (codec, list(retain_groups), full_row_triggers)
+        return real_translator(codec, retain_groups, full_row_triggers)
 
     def fake_sink(**kwargs):
         box.sink_kwargs = kwargs
@@ -117,6 +117,7 @@ def embedding(name="embed", sources=("title",)):
         sources=tuple(sources),
         schema={"embedding": {"type": "[2]f32", "ann": True}},
         compute=lambda rows: [{"embedding": [0.0, 0.0]} for _ in rows],
+        distance_metric="cosine_distance",
     )
 
 
@@ -151,6 +152,28 @@ class TestTransformWiring:
     def test_single_source_transform_adds_no_retain_group(self, captured):
         runner_module._build_sink(make_config(), transforms=[embedding()])
         assert captured.translator_args[1] == []
+
+    def test_distance_metric_reaches_the_writer(self, captured):
+        runner_module._build_sink(make_config(), transforms=[embedding()])
+        assert captured.writer_kwargs["distance_metric"] == "cosine_distance"
+
+    def test_no_distance_metric_without_transforms(self, captured):
+        runner_module._build_sink(make_config())
+        assert captured.writer_kwargs["distance_metric"] is None
+
+    def test_vector_transform_sources_force_full_row_upserts(self, captured):
+        runner_module._build_sink(make_config(), transforms=[embedding()])
+        assert captured.translator_args[2] == frozenset({"title"})
+
+    def test_non_vector_transform_does_not_force_full_rows(self, captured):
+        slug = FunctionTransform(
+            name="slug",
+            sources=("title",),
+            schema={"slug": {"type": "string"}},
+            compute=lambda rows: [{"slug": "x"} for _ in rows],
+        )
+        runner_module._build_sink(make_config(), transforms=[slug])
+        assert captured.translator_args[2] == frozenset()
 
     def test_transforms_reach_the_sink(self, captured):
         transform = embedding()

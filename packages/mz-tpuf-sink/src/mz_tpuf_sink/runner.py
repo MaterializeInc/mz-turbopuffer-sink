@@ -26,7 +26,12 @@ from .frontier import FrontierWatcher
 from .ids import IdCodec
 from .schema import row_schema_from_envelope, turbopuffer_schema
 from .sink import Sink
-from .transform import retain_groups, validate_transforms
+from .transform import (
+    retain_groups,
+    validate_transforms,
+    vector_source_columns,
+    write_distance_metric,
+)
 from .translate import Translator
 from .writer import Writer
 
@@ -111,12 +116,17 @@ def _build_sink(config: SinkConfig, transforms: Sequence[Any] = ()) -> Sink:
             key_deserializer=AvroDeserializer(schema_registry),
             value_deserializer=AvroDeserializer(schema_registry),
         ),
-        translator=Translator(codec, retain_groups=retain_groups(transforms)),
+        translator=Translator(
+            codec,
+            retain_groups=retain_groups(transforms),
+            full_row_triggers=vector_source_columns(transforms),
+        ),
         buffer=TransactionBuffer(warn_bytes=config.buffer_warn_bytes),
         writer=Writer(
             Turbopuffer(**tpuf_kwargs),
             namespace=config.namespace,
             schema=tpuf_schema,
+            distance_metric=write_distance_metric(transforms),
             max_rows_per_request=config.max_rows_per_request,
             max_bytes_per_request=config.max_bytes_per_request,
         ),

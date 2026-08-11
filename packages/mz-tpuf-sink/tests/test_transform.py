@@ -8,19 +8,28 @@ from mz_tpuf_sink.transform import (
     apply_transforms,
     retain_groups,
     validate_transforms,
+    write_distance_metric,
 )
 from mz_tpuf_sink.translate import Translator
 
 VECTOR2 = {"type": "[2]f32", "ann": True}
 
 
-def transform(name="embed", sources=("title",), schema=None, compute=None, batch_size=100):
+def transform(
+    name="embed",
+    sources=("title",),
+    schema=None,
+    compute=None,
+    batch_size=100,
+    distance_metric="cosine_distance",
+):
     return FunctionTransform(
         name=name,
         sources=tuple(sources),
         schema=schema if schema is not None else {"embedding": dict(VECTOR2)},
         compute=compute or (lambda rows: [{"embedding": [1.0, 2.0]} for _ in rows]),
         batch_size=batch_size,
+        distance_metric=distance_metric,
     )
 
 
@@ -150,16 +159,58 @@ class TestValidation:
                 columns={"id", "title"},
             )
 
-    def test_vector_without_ann_warns(self, caplog):
-        import logging
-
-        with caplog.at_level(logging.WARNING):
+    def test_vector_without_ann_is_rejected(self):
+        # turbopuffer refuses the write: "vector attribute must have ann:true"
+        with pytest.raises(ValueError, match="ann"):
             validate_transforms(
                 [transform(schema={"embedding": {"type": "[2]f32"}})],
                 table=table_schema("title"),
                 columns={"id", "title"},
             )
-        assert any("ann" in r.message for r in caplog.records)
+
+    def test_vector_transform_without_a_distance_metric_is_rejected(self):
+        # turbopuffer requires distance_metric on every write to a namespace
+        # holding a vector, so it cannot be discovered later
+        with pytest.raises(ValueError, match="distance_metric"):
+            validate_transforms(
+                [transform(distance_metric=None)],
+                table=table_schema("title"),
+                columns={"id", "title"},
+            )
+
+    def test_conflicting_distance_metrics_are_rejected(self):
+        # the write request carries a single metric for the whole namespace
+        a = transform(name="a", schema={"va": dict(VECTOR2)}, distance_metric="cosine_distance")
+        b = transform(name="b", schema={"vb": dict(VECTOR2)}, distance_metric="euclidean_squared")
+        with pytest.raises(ValueError, match="distance_metric"):
+            validate_transforms(
+                [a, b], table=table_schema("title"), columns={"id", "title"}
+            )
+
+    def test_non_vector_transform_needs_no_distance_metric(self):
+        merged = validate_transforms(
+            [transform(schema={"slug": {"type": "string"}}, distance_metric=None)],
+            table=table_schema("title"),
+            columns={"id", "title"},
+        )
+        assert merged["slug"] == {"type": "string"}
+
+
+class TestDistanceMetric:
+    def test_taken_from_the_vector_transform(self):
+        assert (
+            write_distance_metric([transform(distance_metric="cosine_distance")])
+            == "cosine_distance"
+        )
+
+    def test_none_without_vector_transforms(self):
+        assert write_distance_metric([]) is None
+        assert (
+            write_distance_metric(
+                [transform(schema={"slug": {"type": "string"}}, distance_metric=None)]
+            )
+            is None
+        )
 
     def test_non_transform_object_is_rejected_with_a_useful_message(self):
         with pytest.raises(ValueError, match="Transform"):

@@ -183,6 +183,45 @@ class TestSourceRetention:
         assert set(op.columns) <= set(after)
 
 
+class TestFullRowTriggers:
+    """turbopuffer cannot patch a vector, so an update that changes an
+    embedding's source must be written as a whole-document upsert."""
+
+    def translator(self, *triggers):
+        return Translator(make_codec(), full_row_triggers=frozenset(triggers))
+
+    def test_update_touching_a_trigger_becomes_a_full_row_upsert(self):
+        op = self.translator("name").translate(
+            event({"id": 1, "name": "a", "price": 2}, {"id": 1, "name": "b", "price": 2})
+        )
+        assert op == Upsert(id=1, row={"id": 1, "name": "b", "price": 2})
+
+    def test_update_missing_the_trigger_stays_a_patch(self):
+        op = self.translator("name").translate(
+            event({"id": 1, "name": "a", "price": 2}, {"id": 1, "name": "a", "price": 9})
+        )
+        assert op == Patch(id=1, columns={"price": 9})
+
+    def test_no_triggers_never_upgrades(self):
+        op = self.translator().translate(
+            event({"id": 1, "name": "a"}, {"id": 1, "name": "b"})
+        )
+        assert op == Patch(id=1, columns={"name": "b"})
+
+    def test_no_change_update_still_returns_none(self):
+        op = self.translator("name").translate(
+            event({"id": 1, "name": "a"}, {"id": 1, "name": "a"})
+        )
+        assert op is None
+
+    def test_upgraded_row_carries_every_column_from_after(self):
+        after = {"id": 1, "name": "b", "price": 2, "extra": "kept"}
+        op = self.translator("name").translate(
+            event({"id": 1, "name": "a", "price": 2, "extra": "kept"}, after)
+        )
+        assert set(op.row) == set(after)
+
+
 class TestTypeMapping:
     def test_datetime_maps_to_iso_string(self):
         value = dt.datetime(2026, 8, 11, 12, 0, 0, tzinfo=dt.timezone.utc)

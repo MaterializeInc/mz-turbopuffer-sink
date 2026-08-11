@@ -9,101 +9,33 @@ Skipped unless MZ_TPUF_TURBOPUFFER_API_KEY is available.
 
 from __future__ import annotations
 
-import os
-import pathlib
 import re
 import subprocess
 import time
 
-import psycopg
 import pytest
-from dotenv import load_dotenv
+from harness import (
+    API_KEY,
+    BOOTSTRAP,
+    REGION,
+    REPO,
+    STRONG,
+    create_topic,
+    mz_exec,
+    sink_environment,
+    wait_for,
+)
+from confluent_kafka import TopicPartition
 from turbopuffer import Turbopuffer
 
-E2E_DIR = pathlib.Path(__file__).parent
-REPO = E2E_DIR.parent
-
-load_dotenv(E2E_DIR / ".env")
-
-MZ_DSN = "postgres://materialize@localhost:6875/materialize"
 TOPIC = "products"
-PARTITIONS = 3  # exercises multi-partition + idle/empty-partition settlement
+PARTITIONS = 3
 SINK_NAME = "products_sink"
-# sink names are unique only within a schema, so the sink must be qualified
 QUALIFIED_SINK = f"materialize.public.{SINK_NAME}"
-STRONG = {"level": "strong"}
-
-API_KEY = os.environ.get("MZ_TPUF_TURBOPUFFER_API_KEY")
-REGION = os.environ.get("MZ_TPUF_TURBOPUFFER_REGION", "aws-us-east-1")
 
 pytestmark = pytest.mark.skipif(
     not API_KEY, reason="no turbopuffer API key in e2e/.env"
 )
-
-
-# ---------------------------------------------------------------- helpers
-
-
-def compose(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["docker", "compose", *args],
-        cwd=E2E_DIR,
-        check=check,
-        capture_output=True,
-        text=True,
-    )
-
-
-def wait_for(predicate, description: str, timeout: float = 90.0, interval: float = 1.0):
-    """Poll until predicate returns a truthy value; raise with context on timeout."""
-    deadline = time.monotonic() + timeout
-    last_error: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            result = predicate()
-            if result:
-                return result
-        except Exception as exc:  # not ready yet
-            last_error = exc
-        time.sleep(interval)
-    raise AssertionError(
-        f"timed out after {timeout}s waiting for {description}"
-        + (f" (last error: {last_error})" if last_error else "")
-    )
-
-
-def mz_exec(*statements: str) -> None:
-    """Run each statement on its own.
-
-    Materialize rejects UPDATE/DELETE inside an explicit transaction block, so
-    every write here is a single auto-committed statement. That is sufficient
-    for the atomicity assertions: one statement commits at one Materialize
-    timestamp, and a statement touching N rows therefore produces one
-    N-operation transaction on the sink topic.
-    """
-    with psycopg.connect(MZ_DSN, autocommit=True) as conn:
-        for statement in statements:
-            conn.execute(statement)
-
-
-# ---------------------------------------------------------------- fixtures
-
-
-@pytest.fixture(scope="module")
-def infra():
-    compose("up", "-d", "--wait")
-    try:
-        wait_for(
-            lambda: psycopg.connect(MZ_DSN, connect_timeout=3).close() or True,
-            "Materialize to accept SQL",
-        )
-        compose(
-            "exec", "-T", "redpanda",
-            "rpk", "topic", "create", TOPIC, "-p", str(PARTITIONS),
-        )
-        yield
-    finally:
-        compose("down", "-v", check=False)
 
 
 @pytest.fixture(scope="module")
@@ -131,11 +63,8 @@ def tpuf(namespace_name):
 
 @pytest.fixture(scope="module")
 def materialize(infra):
+    create_topic(TOPIC)
     mz_exec(
-        "CREATE CONNECTION kafka_conn TO KAFKA "
-        "(BROKER 'redpanda:9092', SECURITY PROTOCOL PLAINTEXT)",
-        "CREATE CONNECTION csr_conn TO CONFLUENT SCHEMA REGISTRY "
-        "(URL 'http://redpanda:8081')",
         # covers every temporal shape Materialize emits: `time` is an untagged
         # long, `date`/`timestamp` carry logical types, `interval` is a fixed
         "CREATE TABLE products ("
@@ -169,18 +98,12 @@ def sink_log(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def sink(materialize, namespace_name, group_id, sink_log):
-    env = {
-        **os.environ,
-        "MZ_TPUF_KAFKA_BOOTSTRAP_SERVERS": "localhost:19092",
-        "MZ_TPUF_KAFKA_TOPIC": TOPIC,
-        "MZ_TPUF_KAFKA_GROUP_ID": group_id,
-        "MZ_TPUF_SCHEMA_REGISTRY_URL": "http://localhost:8081",
-        "MZ_TPUF_MATERIALIZE_DSN": MZ_DSN,
-        "MZ_TPUF_MATERIALIZE_SINK": QUALIFIED_SINK,
-        "MZ_TPUF_TURBOPUFFER_API_KEY": API_KEY,
-        "MZ_TPUF_TURBOPUFFER_REGION": REGION,
-        "MZ_TPUF_NAMESPACE": namespace_name,
-    }
+    env = sink_environment(
+        topic=TOPIC,
+        group_id=group_id,
+        namespace=namespace_name,
+        sink=QUALIFIED_SINK,
+    )
     with open(sink_log, "w") as log:
         process = subprocess.Popen(
             ["uv", "run", "mz-tpuf-sink", "--log-level", "INFO"],
@@ -305,7 +228,7 @@ def test_end_to_end(docs, sink, sink_log, tpuf, group_id):
 
     probe = Consumer(
         {
-            "bootstrap.servers": "localhost:19092",
+            "bootstrap.servers": BOOTSTRAP,
             "group.id": group_id,
             "enable.auto.commit": False,
         }

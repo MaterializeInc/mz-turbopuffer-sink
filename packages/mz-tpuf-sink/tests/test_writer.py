@@ -90,6 +90,19 @@ class TestExplicitSchema:
         make_writer(client).write_transaction([Upsert(id=1, row={"id": 1})])
         assert "schema" not in client.requests[0]
 
+    def test_distance_metric_sent_when_configured(self):
+        # turbopuffer rejects any write to a namespace holding a vector unless
+        # the request names a metric
+        client = FakeClient()
+        writer = make_writer(client, distance_metric="cosine_distance")
+        writer.write_transaction([Upsert(id=1, row={"id": 1})])
+        assert client.requests[0]["distance_metric"] == "cosine_distance"
+
+    def test_distance_metric_omitted_when_there_are_no_vectors(self):
+        client = FakeClient()
+        make_writer(client).write_transaction([Upsert(id=1, row={"id": 1})])
+        assert "distance_metric" not in client.requests[0]
+
 
 class TestChunking:
     def test_splits_by_max_rows(self):

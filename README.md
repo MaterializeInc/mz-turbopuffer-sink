@@ -49,6 +49,18 @@ another thread. The library deliberately does not read the environment,
 configure logging, or install signal handlers — those are the caller's to own,
 which is exactly what the CLI package supplies.
 
+**Transforms** derive extra attributes — an embedding, typically — from a
+record's columns, and run after the diff so an unrelated update never pays to
+recompute one:
+
+```python
+run_sink(config, transforms=[embedding])
+```
+
+See the [library README](packages/mz-tpuf-sink#transforms-derived-attributes-and-embeddings)
+for the contract and the turbopuffer vector constraints. Transforms are code, so
+the CLI cannot supply them; use the library directly.
+
 ## Requirements
 
 - Python ≥ 3.12, [uv](https://docs.astral.sh/uv/)
