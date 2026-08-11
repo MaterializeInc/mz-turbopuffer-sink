@@ -19,6 +19,10 @@ class SinkConfig(BaseModel):
     kafka_bootstrap_servers: str
     kafka_topic: str
     kafka_group_id: str = "mz-tpuf-sink"
+    # Raise when transforms make a flush long-running: a consumer that does not
+    # poll within this window is evicted, which drops buffered state and
+    # replays the work.
+    kafka_max_poll_interval_ms: int | None = None
 
     # Confluent Schema Registry
     schema_registry_url: str

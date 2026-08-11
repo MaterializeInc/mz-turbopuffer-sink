@@ -1,3 +1,4 @@
+import pytest
 from confluent_kafka import TopicPartition
 
 from mz_tpuf_sink.buffer import TransactionBuffer
@@ -131,7 +132,7 @@ def make_event(ts, offset, partition=0, doc=1, after=True):
     )
 
 
-def make_sink(consumer, writer=None, frontier=None, partitions=(0,)):
+def make_sink(consumer, writer=None, frontier=None, partitions=(0,), transforms=()):
     codec = IdCodec.from_key_schema(
         {"type": "record", "name": "k", "fields": [{"name": "id", "type": "long"}]}
     )
@@ -145,6 +146,7 @@ def make_sink(consumer, writer=None, frontier=None, partitions=(0,)):
         buffer=buffer,
         writer=writer or RecordingWriter(),
         frontier=frontier or FakeFrontier(),
+        transforms=transforms,
     )
     return sink
 
@@ -323,6 +325,111 @@ class TestBackpressure:
         sink.run_iteration()
         assert consumer.paused == set()
         assert len(writer.transactions) == 3
+
+
+class TestTransforms:
+    def _transform(self, compute, sources=("v",), schema=None):
+        from mz_tpuf_sink.transform import FunctionTransform
+
+        return FunctionTransform(
+            name="embed",
+            sources=tuple(sources),
+            schema=schema or {"embedding": {"type": "[2]f32", "ann": True}},
+            compute=compute,
+            batch_size=100,
+        )
+
+    def test_derived_attribute_reaches_the_writer(self):
+        consumer = FakeConsumer(
+            [FakeMessage(make_event(100, 0)), FakeMessage(make_event(200, 1))]
+        )
+        writer = RecordingWriter()
+        transform = self._transform(
+            lambda rows: [{"embedding": [1.0, 2.0]} for _ in rows]
+        )
+        sink = make_sink(consumer, writer, transforms=[transform])
+        for _ in range(3):
+            sink.run_iteration()
+        assert writer.transactions[0][0].row["embedding"] == [1.0, 2.0]
+
+    def test_compute_runs_once_for_a_document_merged_within_one_timestamp(self):
+        # insert then update of the same document in one timestamp merges to a
+        # single op before transforms run, so the embedding is computed once
+        insert = make_event(100, 0, doc=1)
+        update = ChangeEvent(
+            key={"id": 1},
+            before={"id": 1, "v": 100},
+            after={"id": 1, "v": 999},
+            ts=100,
+            partition=0,
+            offset=1,
+        )
+        consumer = FakeConsumer(
+            [
+                FakeMessage(insert),
+                FakeMessage(update),
+                FakeMessage(make_event(200, 2, doc=2)),
+            ]
+        )
+        calls = []
+
+        def compute(rows):
+            calls.append(len(rows))
+            return [{"embedding": [0.0, 0.0]} for _ in rows]
+
+        sink = make_sink(consumer, RecordingWriter(), transforms=[self._transform(compute)])
+        for _ in range(4):
+            sink.run_iteration()
+        assert calls == [1]
+
+    def test_transform_failure_leaves_offsets_uncommitted(self):
+        from mz_tpuf_sink.transform import TransformError
+
+        consumer = FakeConsumer(
+            [FakeMessage(make_event(100, 0)), FakeMessage(make_event(200, 1))]
+        )
+
+        def boom(rows):
+            raise RuntimeError("model down")
+
+        sink = make_sink(consumer, RecordingWriter(), transforms=[self._transform(boom)])
+        with pytest.raises(TransformError):
+            for _ in range(3):
+                sink.run_iteration()
+        assert consumer.commits == []
+
+
+class TestPerTimestampCommits:
+    def test_each_timestamp_commits_before_the_next_is_written(self):
+        # transforms make redoing work expensive, so a failure at timestamp N
+        # must not force recomputing timestamps before it
+        frontier = FakeFrontier(None)
+        consumer = FakeConsumer(
+            [
+                FakeMessage(make_event(100, 0, doc=1)),
+                FakeMessage(make_event(200, 1, doc=2)),
+                FakeMessage(make_event(300, 2, doc=3)),
+            ]
+        )
+
+        class FailOnSecond:
+            def __init__(self):
+                self.transactions = []
+
+            def write_transaction(self, ops):
+                ops = list(ops)
+                if len(self.transactions) == 1:
+                    raise RuntimeError("tpuf down")
+                self.transactions.append(ops)
+
+        writer = FailOnSecond()
+        sink = make_sink(consumer, writer, frontier)
+        with pytest.raises(RuntimeError):
+            for _ in range(4):
+                sink.run_iteration()
+        # ts=100 was written and its offset committed before ts=200 failed
+        assert len(writer.transactions) == 1
+        assert consumer.commits == [[TopicPartition(TOPIC, 0, 1)]]
 
 
 class TestWriteFailure:

@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any
+import time
+from typing import Any, Sequence
 
 from confluent_kafka import TopicPartition
 
 from .buffer import TransactionBuffer
 from .decoder import Decoder
+from .transform import apply_transforms
 from .translate import Translator
 
 logger = logging.getLogger(__name__)
@@ -30,7 +32,9 @@ class Sink:
         buffer: TransactionBuffer,
         writer: Any,
         frontier: Any,
+        transforms: Sequence[Any] = (),
         poll_timeout: float = 1.0,
+        slow_flush_seconds: float | None = None,
     ):
         self.consumer = consumer
         self.topic = topic
@@ -39,7 +43,9 @@ class Sink:
         self.buffer = buffer
         self.writer = writer
         self.frontier = frontier
+        self.transforms = tuple(transforms)
         self.poll_timeout = poll_timeout
+        self.slow_flush_seconds = slow_flush_seconds
         self._offsets: dict[int, dict[int, int]] = {}  # partition -> ts -> last offset
         self._paused: set[int] = set()
         self._stopped = threading.Event()
@@ -131,10 +137,28 @@ class Sink:
         bound = self.buffer.completeness_bound()
         for ts, ops in self.buffer.take_flushable():
             logger.info("writing transaction ts=%d (%d ops)", ts, len(ops))
-            self.writer.write_transaction(ops)
+            started = time.monotonic()
+            self.writer.write_transaction(apply_transforms(ops, self.transforms))
+            self._warn_if_slow(ts, time.monotonic() - started)
+            # commit each timestamp as it lands, so a later failure does not
+            # force redoing the transforms for the ones already written
+            self._commit_offsets(ts + 1)
         # commit even when nothing was written: a complete timestamp may
         # consist entirely of no-change updates
         self._commit_offsets(bound)
+
+    def _warn_if_slow(self, ts: int, elapsed: float) -> None:
+        """A flush that outlasts max.poll.interval.ms gets the consumer evicted,
+        which drops buffered state and replays the work — so say so early."""
+        if self.slow_flush_seconds and elapsed > self.slow_flush_seconds:
+            logger.warning(
+                "transaction ts=%d took %.1fs to write; approaching the Kafka "
+                "max.poll.interval.ms budget, after which the consumer is "
+                "evicted and the work replays. Raise "
+                "kafka_max_poll_interval_ms or lower a transform's batch_size.",
+                ts,
+                elapsed,
+            )
 
     def _commit_offsets(self, bound: float) -> None:
         commits = []

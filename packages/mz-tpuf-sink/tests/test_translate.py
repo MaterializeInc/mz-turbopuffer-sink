@@ -96,6 +96,93 @@ class TestEnvelopeTranslation:
         assert len(warnings) == 1
 
 
+class TestSourceRetention:
+    """A transform deriving from several columns needs all of them, but a patch
+    carries only what changed. When any column of a group changes, the rest of
+    that group is retained from `after`."""
+
+    def translator(self, *groups):
+        return Translator(make_codec(), retain_groups=[frozenset(g) for g in groups])
+
+    def test_no_groups_leaves_patches_untouched(self):
+        op = self.translator().translate(
+            event({"id": 1, "a": 1, "b": 2}, {"id": 1, "a": 9, "b": 2})
+        )
+        assert op == Patch(id=1, columns={"a": 9})
+
+    def test_sibling_source_is_retained_when_one_changes(self):
+        op = self.translator(("a", "b")).translate(
+            event({"id": 1, "a": 1, "b": 2}, {"id": 1, "a": 9, "b": 2})
+        )
+        assert op == Patch(id=1, columns={"a": 9, "b": 2})
+
+    def test_retained_value_comes_from_after_not_before(self):
+        # both change; each must carry its new value
+        op = self.translator(("a", "b")).translate(
+            event({"id": 1, "a": 1, "b": 2}, {"id": 1, "a": 9, "b": 8})
+        )
+        assert op == Patch(id=1, columns={"a": 9, "b": 8})
+
+    def test_untouched_group_is_not_retained(self):
+        op = self.translator(("c", "d")).translate(
+            event({"id": 1, "a": 1, "c": 3, "d": 4}, {"id": 1, "a": 9, "c": 3, "d": 4})
+        )
+        assert op == Patch(id=1, columns={"a": 9})
+
+    def test_no_change_update_still_returns_none(self):
+        op = self.translator(("a", "b")).translate(
+            event({"id": 1, "a": 1, "b": 2}, {"id": 1, "a": 1, "b": 2})
+        )
+        assert op is None
+
+    def test_retention_does_not_cascade_between_groups(self):
+        # groups {a,b} and {b,c}: changing `a` retains `b` for the first group,
+        # but that must not go on to trigger the second and drag in `c` — each
+        # spurious retention is a paid embedding call downstream
+        op = self.translator(("a", "b"), ("b", "c")).translate(
+            event(
+                {"id": 1, "a": 1, "b": 2, "c": 3},
+                {"id": 1, "a": 9, "b": 2, "c": 3},
+            )
+        )
+        assert op == Patch(id=1, columns={"a": 9, "b": 2})
+
+    def test_retained_values_are_mapped_through_to_attr(self):
+        ts = dt.datetime(2026, 8, 11, tzinfo=dt.timezone.utc)
+        op = self.translator(("a", "when")).translate(
+            event({"id": 1, "a": 1, "when": ts}, {"id": 1, "a": 9, "when": ts})
+        )
+        assert op == Patch(id=1, columns={"a": 9, "when": "2026-08-11T00:00:00+00:00"})
+
+    def test_single_column_groups_are_dropped(self):
+        # the changed column is already in the patch, so a one-source transform
+        # needs no retention at all
+        translator = self.translator(("a",))
+        assert translator._retain_groups == ()
+
+    def test_column_absent_from_after_is_not_invented(self):
+        op = self.translator(("a", "missing")).translate(
+            event({"id": 1, "a": 1}, {"id": 1, "a": 9})
+        )
+        assert op == Patch(id=1, columns={"a": 9})
+
+    def test_inserts_and_deletes_are_unaffected(self):
+        translator = self.translator(("a", "b"))
+        assert translator.translate(event(None, {"id": 1, "a": 1, "b": 2})) == Upsert(
+            id=1, row={"id": 1, "a": 1, "b": 2}
+        )
+        assert translator.translate(event({"id": 1, "a": 1}, None)) == Delete(id=1)
+
+    def test_patch_columns_never_exceed_the_after_row(self):
+        # the guarantee that protects attributes living only in turbopuffer:
+        # retention only ever adds keys drawn from `after`
+        after = {"id": 1, "a": 9, "b": 2, "c": 3}
+        op = self.translator(("a", "b")).translate(
+            event({"id": 1, "a": 1, "b": 2, "c": 3}, after)
+        )
+        assert set(op.columns) <= set(after)
+
+
 class TestTypeMapping:
     def test_datetime_maps_to_iso_string(self):
         value = dt.datetime(2026, 8, 11, 12, 0, 0, tzinfo=dt.timezone.utc)

@@ -10,7 +10,7 @@ import datetime as dt
 import json
 import logging
 from decimal import Decimal
-from typing import Any
+from typing import Any, Sequence
 
 from .ids import IdCodec
 from .models import ChangeEvent, Delete, Op, Patch, Upsert
@@ -60,8 +60,21 @@ def to_attr(value: Any) -> Any:
 
 
 class Translator:
-    def __init__(self, codec: IdCodec):
+    def __init__(
+        self,
+        codec: IdCodec,
+        retain_groups: Sequence[frozenset[str]] = (),
+    ):
+        """`retain_groups` are sets of columns that must travel together.
+
+        A transform deriving one attribute from several columns cannot work
+        from a patch that carries only what changed, so when any column of a
+        group changes the rest of that group is retained from `after`. Groups
+        of one are dropped: that column is already in the patch whenever it
+        matters, so the common case costs nothing.
+        """
         self._codec = codec
+        self._retain_groups = tuple(g for g in retain_groups if len(g) > 1)
         self._warned_id_column = False
 
     def _warn_dropped_id(self, row: dict[str, Any]) -> None:
@@ -95,6 +108,15 @@ class Translator:
             }
             if not changed:
                 return None
+            # snapshot before retaining: otherwise retaining a column for one
+            # group would trigger any other group containing it, and each
+            # spurious trigger is a paid transform call downstream
+            triggers = set(changed)
+            for group in self._retain_groups:
+                if group & triggers:
+                    for field in group - triggers:
+                        if field in event.after:
+                            changed[field] = to_attr(event.after[field])
             return Patch(id=doc_id, columns=changed)
 
         if event.before is not None:

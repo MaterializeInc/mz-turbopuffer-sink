@@ -18,5 +18,12 @@ Each Materialize timestamp is applied as one atomic turbopuffer write:
 
 from .config import SinkConfig
 from .runner import run_sink
+from .transform import FunctionTransform, Transform, TransformError
 
-__all__ = ["SinkConfig", "run_sink"]
+__all__ = [
+    "SinkConfig",
+    "run_sink",
+    "Transform",
+    "FunctionTransform",
+    "TransformError",
+]
