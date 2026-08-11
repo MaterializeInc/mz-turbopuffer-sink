@@ -28,6 +28,20 @@ class TransactionBuffer:
         self._watermark_bound: dict[int, int] = {}
         self._partition_ts: dict[int, set[int]] = {}
 
+    def clear(self) -> None:
+        """Drop all buffered data and settlement state (e.g. on rebalance)."""
+        self._ops.clear()
+        self._max_seen.clear()
+        self._watermark_bound.clear()
+        self._partition_ts.clear()
+
+    @property
+    def assigned(self) -> set[int]:
+        return set(self._assigned)
+
+    def has_pending(self) -> bool:
+        return bool(self._ops)
+
     def set_assignment(self, partitions: list[int]) -> None:
         assigned = set(partitions)
         for state in (self._max_seen, self._watermark_bound, self._partition_ts):

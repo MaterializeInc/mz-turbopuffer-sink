@@ -159,6 +159,17 @@ class TestBackpressure:
 
 
 class TestRebalance:
+    def test_clear_drops_all_buffered_state(self):
+        buf = make_buffer([0])
+        buf.observe(0, 100)
+        buf.add(100, Upsert(id=1, row={"id": 1}))
+        buf.settle_watermark(0, 500)
+        buf.clear()
+        assert buf.take_flushable() == []
+        buf.add(100, Upsert(id=1, row={"id": 1}))
+        # old settlement must not survive the clear
+        assert buf.take_flushable() == []
+
     def test_removed_partition_state_dropped(self):
         buf = make_buffer([0, 1])
         buf.observe(0, 100)
