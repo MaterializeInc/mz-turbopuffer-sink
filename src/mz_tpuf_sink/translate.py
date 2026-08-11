@@ -73,7 +73,7 @@ class Translator:
         logger.warning(
             'value column "id" is dropped: the document ID comes from the '
             "Kafka key (%s), and turbopuffer reserves the \"id\" field",
-            self._codec.field or "composite key",
+            self._codec.field,
         )
 
     def translate(self, event: ChangeEvent) -> Op | None:

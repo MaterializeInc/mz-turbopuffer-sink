@@ -1,35 +1,27 @@
 """Derive turbopuffer document IDs from Avro-decoded Kafka keys.
 
+The sink's KEY must be a single column, and its value becomes the document id
+verbatim. Nothing is combined, truncated, or hashed: every transformation would
+map two distinct keys onto one document, so anything that cannot be represented
+is an error instead.
+
 The ID mode is fixed once, from the key schema, so every document in a
-namespace uses a single turbopuffer ID type (u64, UUID, or string).
+namespace uses a single turbopuffer ID type (uint, uuid, or string).
 """
 
 from __future__ import annotations
 
-import json
-import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-# Namespace for deterministic UUIDv5 hashing of oversized keys.
-ID_NAMESPACE_UUID = uuid.uuid5(uuid.NAMESPACE_URL, "mz-tpuf-sink")
-
-_MAX_STRING_ID_BYTES = 64
-
-# Direct and hashed encodings must never overlap. This namespace constant is
-# public, so without disjoint prefixes anyone who controls key values could
-# craft a >64-byte key whose hash equals another row's short key and silently
-# overwrite that document.
-_DIRECT_PREFIX = "k:"
-_HASH_PREFIX = "h:"
+MAX_STRING_ID_BYTES = 64
 
 
 class IdMode(Enum):
     U64 = "u64"
     UUID = "uuid"
     STRING = "string"
-    JSON = "json"
 
 
 def _unwrap_nullable(avro_type: Any) -> Any:
@@ -40,27 +32,10 @@ def _unwrap_nullable(avro_type: Any) -> Any:
     return avro_type
 
 
-def _hashed(value: str) -> str:
-    return _HASH_PREFIX + str(uuid.uuid5(ID_NAMESPACE_UUID, value))
-
-
-def _string_or_hash(value: str, prefix: str = "") -> str:
-    """Encode a string key, hashing it if it would exceed turbopuffer's limit.
-
-    `prefix` separates the direct encoding from the hashed one. Composite keys
-    pass no prefix: their canonical JSON always starts with "{", which already
-    cannot collide with the "h:" hash form.
-    """
-    direct = prefix + value
-    if len(direct.encode("utf-8")) <= _MAX_STRING_ID_BYTES:
-        return direct
-    return _hashed(value)
-
-
 @dataclass(frozen=True)
 class IdCodec:
     mode: IdMode
-    field: str | None  # None for JSON mode (uses all key fields)
+    field: str
 
     @property
     def tpuf_id_type(self) -> str:
@@ -75,34 +50,52 @@ class IdCodec:
     def from_key_schema(cls, schema: dict) -> "IdCodec":
         if not isinstance(schema, dict) or schema.get("type") != "record":
             raise ValueError(f"key schema must be a record, got: {schema!r}")
+
         fields = schema.get("fields", [])
-        if not fields:
-            raise ValueError("key schema has no fields")
+        if len(fields) != 1:
+            names = ", ".join(f["name"] for f in fields) or "none"
+            raise ValueError(
+                f"the sink's KEY must be exactly one column, got {len(fields)} "
+                f"({names}); a turbopuffer document id is a single value, so "
+                "declare KEY (<one column>) on the sink, adding a single "
+                "derived key column to the upstream view if needed"
+            )
 
-        if len(fields) == 1:
-            name = fields[0]["name"]
-            avro_type = _unwrap_nullable(fields[0]["type"])
-            if isinstance(avro_type, dict) and avro_type.get("logicalType") == "uuid":
-                return cls(IdMode.UUID, name)
-            if avro_type in ("int", "long"):
-                return cls(IdMode.U64, name)
-            if avro_type == "string":
-                return cls(IdMode.STRING, name)
+        name = fields[0]["name"]
+        avro_type = _unwrap_nullable(fields[0]["type"])
 
-        return cls(IdMode.JSON, None)
+        if isinstance(avro_type, dict) and avro_type.get("logicalType") == "uuid":
+            return cls(IdMode.UUID, name)
+        if avro_type in ("int", "long"):
+            return cls(IdMode.U64, name)
+        if avro_type == "string":
+            return cls(IdMode.STRING, name)
+
+        raise ValueError(
+            f"key column {name!r} has Avro type {avro_type!r}, which cannot be "
+            "a turbopuffer document id; use an integer, string, or uuid column"
+        )
 
     def encode(self, key: dict[str, Any]) -> int | str:
+        value = key[self.field]
+
         if self.mode is IdMode.U64:
-            value = key[self.field]
             if value < 0:
                 raise ValueError(
-                    f"key field {self.field!r} is negative ({value}); "
-                    "turbopuffer u64 IDs must be non-negative"
+                    f"key column {self.field!r} is negative ({value}); "
+                    "turbopuffer uint IDs must be non-negative"
                 )
             return value
+
         if self.mode is IdMode.UUID:
-            return key[self.field]
-        if self.mode is IdMode.STRING:
-            return _string_or_hash(key[self.field], _DIRECT_PREFIX)
-        canonical = json.dumps(key, sort_keys=True, separators=(",", ":"), default=str)
-        return _string_or_hash(canonical)
+            return value
+
+        size = len(value.encode("utf-8"))
+        if size > MAX_STRING_ID_BYTES:
+            raise ValueError(
+                f"key column {self.field!r} is {size} bytes, over turbopuffer's "
+                f"{MAX_STRING_ID_BYTES} bytes limit for string IDs; shorten the "
+                "key upstream (for example, sink a hashed key column from the "
+                "Materialize view) so each document id stays distinct"
+            )
+        return value

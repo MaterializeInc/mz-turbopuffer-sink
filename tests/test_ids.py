@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 
-from mz_tpuf_sink.ids import ID_NAMESPACE_UUID, IdCodec
+from mz_tpuf_sink.ids import IdCodec
 
 
 def record_schema(fields):
@@ -25,52 +25,40 @@ class TestSingleIntegerKey:
 
 
 class TestSingleStringKey:
-    """Direct and hashed encodings must occupy disjoint spaces.
+    """Keys are stored verbatim. Anything that will not fit is a hard error
+    rather than a hash: hashing would put two encodings in one ID space, where
+    a short key can equal another key's hash and silently share its document."""
 
-    Both are prefixed so no hashed value can ever equal a raw key: the hash
-    namespace is a published constant, so with user-controlled keys an
-    unprefixed scheme lets someone craft a long key whose hash equals another
-    row's short key and overwrite that document.
-    """
-
-    def test_short_string_is_prefixed(self):
+    def test_short_string_used_directly(self):
         codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
-        assert codec.encode({"id": "user-1"}) == "k:user-1"
+        assert codec.encode({"id": "user-1"}) == "user-1"
 
-    def test_long_string_is_hashed_with_distinct_prefix(self):
+    def test_key_at_the_64_byte_limit_is_accepted(self):
         codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
-        long_key = "x" * 65
-        assert codec.encode({"id": long_key}) == "h:" + str(
-            uuid.uuid5(ID_NAMESPACE_UUID, long_key)
+        at_limit = "x" * 64
+        assert codec.encode({"id": at_limit}) == at_limit
+
+    def test_key_over_64_bytes_is_an_error(self):
+        codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
+        with pytest.raises(ValueError, match="64 bytes"):
+            codec.encode({"id": "x" * 65})
+
+    def test_error_names_the_column_and_actual_size(self):
+        codec = IdCodec.from_key_schema(
+            record_schema([{"name": "slug", "type": "string"}])
         )
+        with pytest.raises(ValueError, match=r"'slug'.*65"):
+            codec.encode({"slug": "x" * 65})
 
-    def test_hash_of_long_key_cannot_collide_with_a_short_key(self):
+    def test_limit_is_measured_in_bytes_not_characters(self):
         codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
-        long_key = "x" * 65
-        colliding_short_key = str(uuid.uuid5(ID_NAMESPACE_UUID, long_key))
-        assert codec.encode({"id": long_key}) != codec.encode(
-            {"id": colliding_short_key}
-        )
+        # 33 two-byte characters is only 33 chars but 66 bytes
+        with pytest.raises(ValueError, match="66"):
+            codec.encode({"id": "é" * 33})
 
-    def test_boundary_measured_in_bytes_after_prefixing(self):
+    def test_multibyte_key_within_the_limit_is_accepted(self):
         codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
-        # 62 raw bytes + "k:" == exactly the 64-byte limit
-        at_limit = "x" * 62
-        assert codec.encode({"id": at_limit}) == "k:" + at_limit
-        over = "x" * 63
-        assert codec.encode({"id": over}).startswith("h:")
-
-    def test_multibyte_boundary_counts_bytes_not_chars(self):
-        codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
-        multibyte = "é" * 33  # 66 bytes, 33 chars
-        assert codec.encode({"id": multibyte}) == "h:" + str(
-            uuid.uuid5(ID_NAMESPACE_UUID, multibyte)
-        )
-
-    def test_every_encoded_id_fits_turbopuffer_limit(self):
-        codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
-        for key in ("a", "x" * 62, "x" * 63, "x" * 500, "é" * 40):
-            assert len(codec.encode({"id": key}).encode("utf-8")) <= 64
+        assert codec.encode({"id": "é" * 32}) == "é" * 32
 
 
 class TestUuidKey:
@@ -92,42 +80,12 @@ class TestUuidKey:
         assert codec.encode({"id": value}) == value
 
 
-class TestCompositeKey:
-    def test_composite_key_becomes_canonical_json(self):
-        schema = record_schema(
-            [{"name": "b", "type": "string"}, {"name": "a", "type": "long"}]
-        )
-        codec = IdCodec.from_key_schema(schema)
-        # keys sorted, compact separators -> deterministic regardless of dict order
-        assert codec.encode({"b": "x", "a": 1}) == '{"a":1,"b":"x"}'
-
-    def test_composite_json_over_64_bytes_hashed_to_uuid5(self):
-        schema = record_schema(
-            [{"name": "b", "type": "string"}, {"name": "a", "type": "long"}]
-        )
-        codec = IdCodec.from_key_schema(schema)
-        payload = {"b": "y" * 100, "a": 2}
-        expected = "h:" + str(
-            uuid.uuid5(ID_NAMESPACE_UUID, '{"a":2,"b":"' + "y" * 100 + '"}')
-        )
-        assert codec.encode(payload) == expected
-
-    def test_composite_direct_form_cannot_collide_with_a_hash(self):
-        # canonical JSON always starts with "{", the hash form with "h:"
-        schema = record_schema(
-            [{"name": "a", "type": "long"}, {"name": "b", "type": "string"}]
-        )
-        codec = IdCodec.from_key_schema(schema)
-        assert codec.encode({"a": 1, "b": "x"}).startswith("{")
-        assert codec.encode({"a": 1, "b": "y" * 100}).startswith("h:")
-
-
 class TestUnionUnwrapping:
     def test_nullable_union_is_unwrapped(self):
         # Materialize registers every key column as ["null", <type>]
         schema = record_schema([{"name": "id", "type": ["null", "string"]}])
         codec = IdCodec.from_key_schema(schema)
-        assert codec.encode({"id": "k"}) == "k:k"
+        assert codec.encode({"id": "k"}) == "k"
 
 
 class TestTurbopufferIdType:
@@ -149,12 +107,6 @@ class TestTurbopufferIdType:
         )
         assert codec.tpuf_id_type == "string"
 
-    def test_composite_key_declares_string(self):
-        schema = record_schema(
-            [{"name": "a", "type": "long"}, {"name": "b", "type": "string"}]
-        )
-        assert IdCodec.from_key_schema(schema).tpuf_id_type == "string"
-
 
 class TestSchemaValidation:
     def test_non_record_key_schema_rejected(self):
@@ -162,5 +114,26 @@ class TestSchemaValidation:
             IdCodec.from_key_schema({"type": "string"})
 
     def test_empty_field_list_rejected(self):
-        with pytest.raises(ValueError, match="field"):
+        with pytest.raises(ValueError, match="exactly one"):
             IdCodec.from_key_schema(record_schema([]))
+
+    def test_composite_key_rejected(self):
+        # a turbopuffer document id is one value; combining columns would mean
+        # inventing an encoding, so require the sink's KEY to be one column
+        schema = record_schema(
+            [{"name": "a", "type": "long"}, {"name": "b", "type": "string"}]
+        )
+        with pytest.raises(ValueError, match="exactly one"):
+            IdCodec.from_key_schema(schema)
+
+    def test_composite_key_error_names_the_columns(self):
+        schema = record_schema(
+            [{"name": "tenant", "type": "long"}, {"name": "sku", "type": "string"}]
+        )
+        with pytest.raises(ValueError, match="tenant, sku"):
+            IdCodec.from_key_schema(schema)
+
+    def test_unsupported_single_column_type_rejected(self):
+        schema = record_schema([{"name": "id", "type": "boolean"}])
+        with pytest.raises(ValueError, match="boolean"):
+            IdCodec.from_key_schema(schema)

@@ -120,10 +120,9 @@ memory is bounded by roughly two transactions per partition.
 
 | Source | turbopuffer |
 | --- | --- |
-| Kafka key: single `int`/`long` column | `uint` ID (negative values are an error) |
-| Kafka key: single `string` column | `k:<key>` string ID, or `h:<uuidv5>` if too long |
-| Kafka key: single `uuid` logical type | `uuid` ID |
-| Kafka key: composite | canonical-JSON string ID, or `h:<uuidv5>` if too long |
+| Kafka key: `int`/`long` column | `uint` ID (negative values are an error) |
+| Kafka key: `string` column | `string` ID, verbatim (max 64 bytes) |
+| Kafka key: `uuid` logical type | `uuid` ID |
 | `timestamp`/`timestamptz`/`date` | `datetime` (sent as ISO-8601) |
 | `time` | `int` (Materialize sends an untagged microsecond count) |
 | `interval` | base64 `string` (Avro `fixed`) |
@@ -140,14 +139,27 @@ A value column named `id` is not treated as an attribute; the document ID
 always comes from the Kafka key. The sink logs a warning once if a value
 column named `id` is dropped because the key column has a different name.
 
-String document IDs carry a one-character namespace: a key used directly
-becomes `k:<key>`, and a key too long for turbopuffer's 64-byte limit becomes
-`h:<uuidv5>`. The two forms must not overlap — the hash namespace is a public
-constant, so without the prefixes anyone able to choose key values could craft
-an over-long key whose hash equals another row's short key and overwrite that
-document. The prefix costs two bytes, so keys up to 62 bytes are stored
-directly. Composite keys need no prefix: their canonical JSON always starts
-with `{`.
+### The sink's KEY must be one column
+
+A turbopuffer document id is a single value, and this sink never invents an
+encoding for one. The key is used verbatim, so:
+
+- **`KEY` must name exactly one column.** A composite key is rejected at
+  startup. If you need one, derive a single key column in the upstream view
+  and sink that.
+- **A string key over 64 bytes is an error**, not a hash. Hashing would put
+  two encodings into one id space, where a short key can equal another key's
+  hash and the two rows would silently share — and overwrite — one document.
+  Shorten the key upstream instead; sinking a hashed key column from the view
+  makes the choice explicit and visible in your schema.
+- **A negative integer key is an error**, since turbopuffer's numeric ids are
+  unsigned.
+
+These are startup or per-record failures on purpose: the sink stops rather
+than writing a document whose identity it cannot guarantee is unique. Note a
+per-record failure is a poison message — the sink exits, and on restart it
+replays the same record and exits again — so an over-long key needs an
+upstream fix, not a retry.
 
 `numeric` becomes a turbopuffer `float`, so range filters and sorting work
 (`["price", "Gt", 10]`). Materialize encodes unconstrained `numeric` as an Avro
