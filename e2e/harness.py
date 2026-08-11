@@ -83,7 +83,12 @@ def create_topic(name: str) -> None:
     compose("exec", "-T", "redpanda", "rpk", "topic", "create", name, "-p", str(PARTITIONS))
 
 
-def sink_environment(*, topic: str, group_id: str, namespace: str, sink: str) -> dict:
+SINK_COMMAND = ["uv", "run", "--no-sync", "python", "e2e/sink_runner.py"]
+
+
+def sink_environment(
+    *, topic: str, group_id: str, namespace: str, sink: str, extra: dict | None = None
+) -> dict:
     return {
         **os.environ,
         "MZ_TPUF_KAFKA_BOOTSTRAP_SERVERS": BOOTSTRAP,
@@ -95,4 +100,5 @@ def sink_environment(*, topic: str, group_id: str, namespace: str, sink: str) ->
         "MZ_TPUF_TURBOPUFFER_API_KEY": API_KEY or "",
         "MZ_TPUF_TURBOPUFFER_REGION": REGION,
         "MZ_TPUF_NAMESPACE": namespace,
+        **(extra or {}),  # last, so a scenario's override wins
     }

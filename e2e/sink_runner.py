@@ -1,8 +1,11 @@
-"""Run the sink with a deterministic 'embedding' transform, for the e2e test.
+"""Run the sink as a subprocess for the end-to-end tests.
 
-The embedding is a hash, not a model: the point is to prove the sink recomputes
-it exactly when a source column changes, which needs no external service and
-stays reproducible.
+This is the library's own entry point wired up the way an application would do
+it: build a SinkConfig, install signal handlers, call run_sink. Setting
+MZ_TPUF_E2E_EMBEDDING=1 adds a derived vector attribute.
+
+The embedding is a hash rather than a model, so the tests need no external
+service and can assert exact values.
 """
 
 from __future__ import annotations
@@ -54,12 +57,13 @@ def main() -> None:
         turbopuffer_region=os.environ["MZ_TPUF_TURBOPUFFER_REGION"],
         namespace=os.environ["MZ_TPUF_NAMESPACE"],
     )
+    transforms = [EMBEDDING] if os.environ.get("MZ_TPUF_E2E_EMBEDDING") else []
 
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
 
-    run_sink(config, stop=stop, transforms=[EMBEDDING])
+    run_sink(config, stop=stop, transforms=transforms)
 
 
 if __name__ == "__main__":

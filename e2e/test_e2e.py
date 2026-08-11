@@ -16,6 +16,7 @@ import time
 import pytest
 from harness import (
     API_KEY,
+    SINK_COMMAND,
     namespace_for,
     BOOTSTRAP,
     REGION,
@@ -107,7 +108,7 @@ def sink(materialize, namespace_name, group_id, sink_log):
     )
     with open(sink_log, "w") as log:
         process = subprocess.Popen(
-            ["uv", "run", "mz-tpuf-sink", "--log-level", "INFO"],
+            SINK_COMMAND,
             cwd=REPO,
             env=env,
             stdout=log,

@@ -1,31 +1,27 @@
 [project]
-name = "mz-turbopuffer-sink-workspace"
-version = "0"
-description = "Development workspace for the mz-tpuf-sink packages"
+name = "mz-tpuf-sink"
+version = "0.1.0"
+description = "Keep a turbopuffer namespace in sync with a Materialize view"
+readme = "README.md"
 requires-python = ">=3.12"
+authors = [
+    { name = "Materialize", email = "support@materialize.com" }
+]
 dependencies = [
-    "mz-tpuf-sink",
-    "mz-tpuf-sink-cli",
+    "confluent-kafka[avro,schemaregistry]>=2.15.0",
+    "psycopg[binary]>=3.3.4",
+    "pydantic>=2.13.4",
+    "turbopuffer>=2.8.0",
 ]
 
-[tool.uv]
-# the root is a development shell, not a distribution
-package = false
-
-[tool.uv.workspace]
-members = ["packages/*"]
-
-[tool.uv.sources]
-mz-tpuf-sink = { workspace = true }
-mz-tpuf-sink-cli = { workspace = true }
+[build-system]
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 # e2e/ needs Docker and a real turbopuffer key; run it explicitly with
 # `uv run pytest e2e`
-testpaths = ["packages/mz-tpuf-sink/tests", "packages/mz-tpuf-sink-cli/tests"]
-# each package has its own tests/ directory; importlib mode keeps same-named
-# test modules in different packages from colliding
-addopts = "--import-mode=importlib"
+testpaths = ["tests"]
 # e2e test modules share helpers from e2e/harness.py
 pythonpath = ["e2e"]
 
@@ -33,4 +29,6 @@ pythonpath = ["e2e"]
 dev = [
     "fastavro>=1.12.2",
     "pytest>=9.1.1",
+    # the end-to-end suite loads its turbopuffer key from e2e/.env
+    "python-dotenv>=1.2.2",
 ]

@@ -14,6 +14,7 @@ import time
 import pytest
 from harness import (
     API_KEY,
+    SINK_COMMAND,
     namespace_for,
     REGION,
     REPO,
@@ -23,7 +24,7 @@ from harness import (
     sink_environment,
     wait_for,
 )
-from embedding_sink import fake_embed
+from sink_runner import fake_embed
 from turbopuffer import Turbopuffer
 
 TOPIC = "articles"
@@ -73,10 +74,11 @@ def sink(materialize, namespace_name, tmp_path_factory):
         group_id=f"e2e-{namespace_name}",
         namespace=namespace_name,
         sink=QUALIFIED_SINK,
+        extra={"MZ_TPUF_E2E_EMBEDDING": "1"},
     )
     with open(log, "w") as handle:
         process = subprocess.Popen(
-            ["uv", "run", "python", "e2e/embedding_sink.py"],
+            SINK_COMMAND,
             cwd=REPO,
             env=env,
             stdout=handle,

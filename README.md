@@ -5,15 +5,16 @@ Keep a [turbopuffer](https://turbopuffer.com) namespace in sync with a
 
 Materialize maintains your view incrementally as the underlying data changes.
 This project mirrors that view into turbopuffer, so a namespace you search
-against is always a current reflection of a query you already trust — no
-rebuild job, no nightly reindex, no drift between the two.
-
-Point it at a Materialize sink and leave it running.
+against is always a current reflection of a query you already trust.
 
 ```sh
-git clone https://github.com/MaterializeInc/mz-turbopuffer-sink
-cd mz-turbopuffer-sink && uv sync
-uv run mz-tpuf-sink
+uv add "mz-tpuf-sink @ git+https://github.com/MaterializeInc/mz-turbopuffer-sink"
+```
+
+```python
+from mz_tpuf_sink import SinkConfig, run_sink
+
+run_sink(SinkConfig(...))   # blocks until stopped
 ```
 
 ## What it gives you
@@ -23,17 +24,17 @@ turbopuffer as fifty changed documents at once. A search never sees half of an
 update.
 
 **Updates touch only what changed.** Changing a price rewrites the price and
-leaves the document's other attributes alone — including any you wrote yourself,
-outside this sink.
+leaves the document's other attributes alone.
 
 **Deletes propagate.** A row that leaves the view leaves the namespace.
 
-**Your schema comes across on its own.** Column types are read from the sink
-and declared to turbopuffer, so numbers stay numbers and timestamps stay
-timestamps, filterable and sortable. There is no mapping file to maintain, and
-adding a column to your view needs no change here.
+**Your schema comes across on its own.** Column types are read from the Avro
+schema the sink publishes to Schema Registry and declared to turbopuffer, so
+numbers stay numbers and timestamps stay timestamps, filterable and sortable.
+There is no mapping file to maintain, and adding a column to your view needs no
+change here.
 
-**Embeddings stay fresh without being recomputed.** See below.
+**Embeddings are recomputed only when the text behind them changes.**
 
 ## Embeddings
 
@@ -79,21 +80,17 @@ run_sink(
 ```
 
 Edit an article's `title` and it is re-embedded. Change its `view_count` a
-thousand times and it is not embedded once. That distinction is the whole
-point: the embedding bill tracks edits to the text, not writes to the table.
+thousand times and it is not embedded once, so the embedding bill tracks edits
+to the text rather than writes to the table.
+
+Each row handed to `compute` holds exactly the columns named in `sources`, plus
+`id`. Return one mapping per row, in the same order, containing the attributes
+named in `schema`.
 
 A transform is ordinary Python, so it can call any model, local or hosted, and
 it receives records in batches so one API call covers many documents. It can
 produce anything, not just vectors — a slug, a sentiment score, a translated
 title.
-
-One wrinkle worth knowing: turbopuffer does not allow a vector to be modified
-in place, so a record whose embedding is recomputed is rewritten in full. For
-those records — and only those — attributes you added to the document outside
-this sink are replaced rather than preserved.
-
-Transforms are code rather than configuration, so they need the library. The
-command-line runner covers everything else.
 
 ## What you need
 
@@ -118,13 +115,13 @@ command-line runner covers everything else.
 
 Run one process per topic, writing to one namespace.
 
-## What your columns become
+## Type mapping
 
 | Materialize | turbopuffer |
 | --- | --- |
 | `text` | `string` |
 | `int`, `bigint` | `int` |
-| `numeric`, `float`, `double` | `float` — range filters and sorting work |
+| `numeric`, `float`, `double` | `float` |
 | `boolean` | `bool` |
 | `timestamp`, `timestamptz`, `date` | `datetime` |
 | `time` | `int` (microseconds since midnight) |
@@ -134,13 +131,6 @@ Run one process per topic, writing to one namespace.
 
 A namespace holds at most two vector attributes, and a vector needs both
 `ann: True` and a `distance_metric`.
-
-## Packages
-
-| Package | Use it when |
-| --- | --- |
-| [`mz-tpuf-sink`](packages/mz-tpuf-sink) | You want embeddings or other transforms, or you are embedding the sink in your own process. Exposes `SinkConfig` and `run_sink`. |
-| [`mz-tpuf-sink-cli`](packages/mz-tpuf-sink-cli) | You want to run it as a service. Provides the `mz-tpuf-sink` command, configured entirely through `MZ_TPUF_*` environment variables — the [full list is here](packages/mz-tpuf-sink-cli/README.md). |
 
 ## Development
 
