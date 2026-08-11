@@ -14,8 +14,40 @@ topic and applies each one as **a single atomic turbopuffer write request**:
 - **delete** (`after: null`) → delete by ID
 
 It is generic over the schema: the topic must be `FORMAT AVRO` with
-`ENVELOPE DEBEZIUM` (and a `KEY`), registered in a Confluent-compatible Schema
-Registry. Every Avro field maps to a turbopuffer attribute.
+`ENVELOPE DEBEZIUM` (and a single-column `KEY`), registered in a
+Confluent-compatible Schema Registry. Every Avro field maps to a turbopuffer
+attribute.
+
+## Packages
+
+This repository is a uv workspace holding two distributions:
+
+| Package | What it is |
+| --- | --- |
+| [`packages/mz-tpuf-sink`](packages/mz-tpuf-sink) | The library. Exposes `SinkConfig` and `run_sink(config, stop=None)` — no CLI, no environment reading. |
+| [`packages/mz-tpuf-sink-cli`](packages/mz-tpuf-sink-cli) | A thin wrapper providing the `mz-tpuf-sink` command: loads `MZ_TPUF_*` settings, sets up logging and signal handlers, calls `run_sink`. |
+
+Embedding it in your own process:
+
+```python
+from mz_tpuf_sink import SinkConfig, run_sink
+
+run_sink(SinkConfig(
+    kafka_bootstrap_servers="localhost:9092",
+    kafka_topic="events",
+    schema_registry_url="http://localhost:8081",
+    materialize_dsn="postgres://materialize@localhost:6875/materialize",
+    materialize_sink="materialize.public.events_sink",
+    turbopuffer_api_key="tpuf_...",
+    turbopuffer_region="aws-us-east-1",
+    namespace="events",
+))
+```
+
+`run_sink` blocks; pass a `threading.Event` as `stop` to shut it down from
+another thread. The library deliberately does not read the environment,
+configure logging, or install signal handlers — those are the caller's to own,
+which is exactly what the CLI package supplies.
 
 ## Requirements
 
@@ -46,26 +78,9 @@ uv sync
 uv run mz-tpuf-sink
 ```
 
-Configuration is environment variables (or a `.env` file):
-
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `MZ_TPUF_KAFKA_BOOTSTRAP_SERVERS` | yes | | Kafka bootstrap servers |
-| `MZ_TPUF_KAFKA_TOPIC` | yes | | Topic produced by the Materialize sink |
-| `MZ_TPUF_KAFKA_GROUP_ID` | | `mz-tpuf-sink` | Consumer group ID |
-| `MZ_TPUF_SCHEMA_REGISTRY_URL` | yes | | Confluent Schema Registry URL |
-| `MZ_TPUF_SCHEMA_REGISTRY_AUTH` | | | `user:password` for the registry |
-| `MZ_TPUF_MATERIALIZE_DSN` | yes | | e.g. `postgres://materialize@localhost:6875/materialize` |
-| `MZ_TPUF_MATERIALIZE_SINK` | yes | | Sink, fully qualified as `database.schema.sink` |
-| `MZ_TPUF_TURBOPUFFER_API_KEY` | yes | | turbopuffer API key |
-| `MZ_TPUF_TURBOPUFFER_REGION` | | | turbopuffer region (e.g. `gcp-us-central1`) |
-| `MZ_TPUF_TURBOPUFFER_BASE_URL` | | | Overrides region; useful for testing |
-| `MZ_TPUF_NAMESPACE` | yes | | Target turbopuffer namespace |
-| `MZ_TPUF_MAX_ROWS_PER_REQUEST` | | `10000` | Chunking limit (rows) |
-| `MZ_TPUF_MAX_BYTES_PER_REQUEST` | | `200 MiB` | Chunking limit (bytes) |
-| `MZ_TPUF_BUFFER_WARN_BYTES` | | `1 GiB` | Warn when buffered transactions exceed this |
-| `MZ_TPUF_POLL_TIMEOUT` | | `1.0` | Kafka poll timeout (seconds) |
-| `MZ_TPUF_FRONTIER_READY_TIMEOUT` | | `15.0` | Fail startup if no frontier row arrives (wrong sink name) |
+Configuration comes from `MZ_TPUF_*` environment variables or a `.env` file;
+the full table lives in the
+[CLI package README](packages/mz-tpuf-sink-cli/README.md).
 
 Run **one process per topic**, one topic per namespace.
 
@@ -189,11 +204,16 @@ observed value is `NULL`, which offer nothing to infer from.
 uv run pytest          # unit tests only; no Docker, no network
 ```
 
-The unit suite covers the completeness rule, backpressure, per-key merging,
-Debezium diffing, ID derivation, schema derivation, chunking, and retry
-behavior. One test drives the real turbopuffer SDK client over a mock HTTP
-transport so the request shape and URL routing are checked without network
-access.
+Both packages' tests run from the workspace root. The library suite covers the
+completeness rule, backpressure, per-key merging, Debezium diffing, ID
+derivation, schema derivation, chunking, and retry behavior; one test drives
+the real turbopuffer SDK client over a mock HTTP transport so the request shape
+and URL routing are checked without network access. The CLI suite covers
+environment loading, `.env` handling, and that a signal requests a clean
+shutdown.
+
+To work on one package alone, `uv run --package mz-tpuf-sink pytest
+packages/mz-tpuf-sink/tests`.
 
 ### End-to-end test
 

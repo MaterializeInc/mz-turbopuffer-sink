@@ -1,31 +1,31 @@
 [project]
-name = "mz-tpuf-sink"
-version = "0.1.0"
-description = "Atomically sink Materialize Kafka topics (Avro + Debezium) into turbopuffer"
-readme = "README.md"
-authors = [
-    { email = "sjwiesman@gmail.com" }
-]
+name = "mz-turbopuffer-sink-workspace"
+version = "0"
+description = "Development workspace for the mz-tpuf-sink packages"
 requires-python = ">=3.12"
 dependencies = [
-    "click>=8.4.2",
-    "confluent-kafka[avro,schemaregistry]>=2.15.0",
-    "psycopg[binary]>=3.3.4",
-    "pydantic-settings>=2.15.0",
-    "turbopuffer>=2.8.0",
+    "mz-tpuf-sink",
+    "mz-tpuf-sink-cli",
 ]
 
-[project.scripts]
-mz-tpuf-sink = "mz_tpuf_sink.cli:main"
+[tool.uv]
+# the root is a development shell, not a distribution
+package = false
 
-[build-system]
-requires = ["uv_build>=0.11.32,<0.12.0"]
-build-backend = "uv_build"
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+mz-tpuf-sink = { workspace = true }
+mz-tpuf-sink-cli = { workspace = true }
 
 [tool.pytest.ini_options]
 # e2e/ needs Docker and a real turbopuffer key; run it explicitly with
 # `uv run pytest e2e`
-testpaths = ["tests"]
+testpaths = ["packages/mz-tpuf-sink/tests", "packages/mz-tpuf-sink-cli/tests"]
+# each package has its own tests/ directory; importlib mode keeps same-named
+# test modules in different packages from colliding
+addopts = "--import-mode=importlib"
 
 [dependency-groups]
 dev = [

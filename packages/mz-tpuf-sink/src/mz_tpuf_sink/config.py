@@ -1,13 +1,19 @@
-"""Configuration via environment variables (MZ_TPUF_*) or a .env file."""
+"""Configuration for a sink run.
+
+This is a plain model: it is constructed by the caller and never reads the
+environment. Loading configuration from env vars or a file is the CLI's job,
+so that embedding the library cannot pick up ambient settings by surprise.
+"""
 
 from __future__ import annotations
 
-from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="MZ_TPUF_", env_file=".env")
+class SinkConfig(BaseModel):
+    """Everything needed to sink one Kafka topic into one turbopuffer namespace."""
+
+    model_config = ConfigDict(extra="forbid")
 
     # Kafka
     kafka_bootstrap_servers: str

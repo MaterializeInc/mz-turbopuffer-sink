@@ -2,6 +2,13 @@ version = 1
 revision = 3
 requires-python = ">=3.12"
 
+[manifest]
+members = [
+    "mz-tpuf-sink",
+    "mz-tpuf-sink-cli",
+    "mz-turbopuffer-sink-workspace",
+]
+
 [[package]]
 name = "aiohappyeyeballs"
 version = "2.7.1"
@@ -760,13 +767,46 @@ wheels = [
 [[package]]
 name = "mz-tpuf-sink"
 version = "0.1.0"
-source = { editable = "." }
+source = { editable = "packages/mz-tpuf-sink" }
 dependencies = [
-    { name = "click" },
     { name = "confluent-kafka", extra = ["avro", "schemaregistry"] },
     { name = "psycopg", extra = ["binary"] },
-    { name = "pydantic-settings" },
+    { name = "pydantic" },
     { name = "turbopuffer" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "confluent-kafka", extras = ["avro", "schemaregistry"], specifier = ">=2.15.0" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4" },
+    { name = "pydantic", specifier = ">=2.13.4" },
+    { name = "turbopuffer", specifier = ">=2.8.0" },
+]
+
+[[package]]
+name = "mz-tpuf-sink-cli"
+version = "0.1.0"
+source = { editable = "packages/mz-tpuf-sink-cli" }
+dependencies = [
+    { name = "click" },
+    { name = "mz-tpuf-sink" },
+    { name = "pydantic-settings" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "click", specifier = ">=8.4.2" },
+    { name = "mz-tpuf-sink", editable = "packages/mz-tpuf-sink" },
+    { name = "pydantic-settings", specifier = ">=2.15.0" },
+]
+
+[[package]]
+name = "mz-turbopuffer-sink-workspace"
+version = "0"
+source = { virtual = "." }
+dependencies = [
+    { name = "mz-tpuf-sink" },
+    { name = "mz-tpuf-sink-cli" },
 ]
 
 [package.dev-dependencies]
@@ -777,11 +817,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "click", specifier = ">=8.4.2" },
-    { name = "confluent-kafka", extras = ["avro", "schemaregistry"], specifier = ">=2.15.0" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4" },
-    { name = "pydantic-settings", specifier = ">=2.15.0" },
-    { name = "turbopuffer", specifier = ">=2.8.0" },
+    { name = "mz-tpuf-sink", editable = "packages/mz-tpuf-sink" },
+    { name = "mz-tpuf-sink-cli", editable = "packages/mz-tpuf-sink-cli" },
 ]
 
 [package.metadata.requires-dev]
