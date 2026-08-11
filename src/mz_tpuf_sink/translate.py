@@ -17,13 +17,37 @@ from .models import ChangeEvent, Delete, Op, Patch, Upsert
 
 logger = logging.getLogger(__name__)
 
+# A float64 carries ~15-17 significant decimal digits; beyond that the
+# conversion below is genuinely lossy and worth telling the operator about.
+_FLOAT_SIGNIFICANT_DIGITS = 17
+_warned_decimal_precision = False
+
+
+def _decimal_to_float(value: Decimal) -> float:
+    """Materialize numerics arrive as Avro decimals padded to scale 39.
+
+    Storing them as numbers (rather than text) is what makes turbopuffer range
+    filters and sorting work on them.
+    """
+    global _warned_decimal_precision
+    digits = len(value.normalize().as_tuple().digits)
+    if digits > _FLOAT_SIGNIFICANT_DIGITS and not _warned_decimal_precision:
+        _warned_decimal_precision = True
+        logger.warning(
+            "decimal %s has %d significant digits and loses precision as a "
+            "float; turbopuffer attributes have no exact decimal type",
+            value,
+            digits,
+        )
+    return float(value)
+
 
 def to_attr(value: Any) -> Any:
     """Map a decoded Avro value to a turbopuffer attribute value."""
     if isinstance(value, (dt.datetime, dt.date, dt.time)):
         return value.isoformat()
     if isinstance(value, Decimal):
-        return str(value)
+        return _decimal_to_float(value)
     if isinstance(value, bytes):
         return base64.b64encode(value).decode("ascii")
     if isinstance(value, dict):

@@ -68,6 +68,29 @@ class TestRequestShape:
         assert client.requests == []
 
 
+class TestExplicitSchema:
+    """turbopuffer infers attribute types from the first value it sees, which
+    misreads an integral float as int; declaring the schema prevents that."""
+
+    SCHEMA = {"price": {"type": "float"}, "name": {"type": "string"}}
+
+    def test_schema_sent_with_every_request(self):
+        client = FakeClient()
+        writer = make_writer(
+            client, schema=self.SCHEMA, max_rows_per_request=1
+        )
+        writer.write_transaction(
+            [Upsert(id=1, row={"id": 1, "price": 5.0}), Upsert(id=2, row={"id": 2, "price": 9.99})]
+        )
+        assert len(client.requests) == 2
+        assert all(r["schema"] == self.SCHEMA for r in client.requests)
+
+    def test_schema_omitted_when_not_configured(self):
+        client = FakeClient()
+        make_writer(client).write_transaction([Upsert(id=1, row={"id": 1})])
+        assert "schema" not in client.requests[0]
+
+
 class TestChunking:
     def test_splits_by_max_rows(self):
         client = FakeClient()

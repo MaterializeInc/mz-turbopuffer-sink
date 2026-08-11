@@ -145,7 +145,9 @@ class Sink:
             last_offset = max(by_ts.pop(ts) for ts in done)
             commits.append(TopicPartition(self.topic, partition, last_offset + 1))
         if commits:
-            self.consumer.commit(commits, asynchronous=False)
+            # `offsets=` is required: the first positional parameter of
+            # Consumer.commit is `message`, not an offset list
+            self.consumer.commit(offsets=commits, asynchronous=False)
 
     def _apply_backpressure(self) -> None:
         desired = self.buffer.pause_set()

@@ -18,6 +18,7 @@ from .config import Settings
 from .decoder import Decoder
 from .frontier import FrontierWatcher
 from .ids import IdCodec
+from .schema import row_schema_from_envelope, turbopuffer_schema
 from .sink import Sink
 from .translate import Translator
 from .writer import Writer
@@ -36,6 +37,20 @@ def build_sink(settings: Settings) -> Sink:
     ).schema.schema_str
     codec = IdCodec.from_key_schema(json.loads(key_schema))
     logger.info("document ID mode: %s", codec.mode.value)
+
+    # Declare attribute types explicitly rather than letting turbopuffer infer
+    # them from the first value (an integral float would be read as int and
+    # reject every later fractional value).
+    value_schema = schema_registry.get_latest_version(
+        f"{settings.kafka_topic}-value"
+    ).schema.schema_str
+    tpuf_schema = turbopuffer_schema(
+        row_schema_from_envelope(json.loads(value_schema))
+    )
+    logger.info(
+        "turbopuffer attribute schema: %s",
+        {name: spec["type"] for name, spec in tpuf_schema.items()},
+    )
 
     consumer = Consumer(
         {
@@ -71,6 +86,7 @@ def build_sink(settings: Settings) -> Sink:
         writer=Writer(
             Turbopuffer(**tpuf_kwargs),
             namespace=settings.namespace,
+            schema=tpuf_schema,
             max_rows_per_request=settings.max_rows_per_request,
             max_bytes_per_request=settings.max_bytes_per_request,
         ),

@@ -35,6 +35,7 @@ class Writer:
         client: Any,
         *,
         namespace: str,
+        schema: dict[str, Any] | None = None,
         max_rows_per_request: int = 10_000,
         max_bytes_per_request: int = 200 * 1024 * 1024,
         max_attempts: int = 5,
@@ -43,6 +44,7 @@ class Writer:
     ):
         self._client = client
         self._namespace = namespace
+        self._schema = schema
         self._max_rows = max_rows_per_request
         self._max_bytes = max_bytes_per_request
         self._max_attempts = max_attempts
@@ -87,6 +89,8 @@ class Writer:
             request["patch_rows"] = patches
         if deletes:
             request["deletes"] = deletes
+        if self._schema:
+            request["schema"] = self._schema
 
         backoff = self._initial_backoff
         for attempt in range(1, self._max_attempts + 1):

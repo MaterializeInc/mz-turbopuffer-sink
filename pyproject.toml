@@ -22,6 +22,11 @@ mz-tpuf-sink = "mz_tpuf_sink.cli:main"
 requires = ["uv_build>=0.11.32,<0.12.0"]
 build-backend = "uv_build"
 
+[tool.pytest.ini_options]
+# e2e/ needs Docker and a real turbopuffer key; run it explicitly with
+# `uv run pytest e2e`
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "fastavro>=1.12.2",

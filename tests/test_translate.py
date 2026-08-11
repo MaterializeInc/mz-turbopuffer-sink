@@ -4,9 +4,17 @@ from decimal import Decimal
 
 import pytest
 
+from mz_tpuf_sink import translate as translate_module
 from mz_tpuf_sink.ids import IdCodec
 from mz_tpuf_sink.models import ChangeEvent, Delete, Patch, Upsert
 from mz_tpuf_sink.translate import Translator, to_attr
+
+
+@pytest.fixture(autouse=True)
+def reset_precision_warning():
+    """to_attr warns once per process; keep tests order-independent."""
+    translate_module._warned_decimal_precision = False
+    yield
 
 
 def make_codec():
@@ -96,8 +104,36 @@ class TestTypeMapping:
     def test_date_maps_to_iso_string(self):
         assert to_attr(dt.date(2026, 8, 11)) == "2026-08-11"
 
-    def test_decimal_maps_to_string(self):
-        assert to_attr(Decimal("1.50")) == "1.50"
+    def test_decimal_maps_to_float(self):
+        # turbopuffer can range-filter and sort numbers, not numeric strings
+        assert to_attr(Decimal("1.50")) == 1.5
+
+    def test_decimal_drops_avro_scale_padding(self):
+        # Materialize numeric arrives as Avro decimal with scale 39
+        padded = Decimal("9.990000000000000000000000000000000000000")
+        assert to_attr(padded) == 9.99
+
+    def test_integral_decimal_is_still_a_float(self):
+        assert to_attr(Decimal("30.00")) == 30.0
+        assert isinstance(to_attr(Decimal("30.00")), float)
+
+    def test_warns_once_when_decimal_precision_exceeds_float(self, caplog):
+        import logging
+
+        # 20 significant digits cannot survive a float round-trip
+        lossy = Decimal("1.2345678901234567890")
+        with caplog.at_level(logging.WARNING):
+            to_attr(lossy)
+            to_attr(lossy)
+        warnings = [r for r in caplog.records if "precision" in r.message]
+        assert len(warnings) == 1
+
+    def test_no_warning_for_ordinary_decimals(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            to_attr(Decimal("9.990000000000000000000000000000000000000"))
+        assert [r for r in caplog.records if "precision" in r.message] == []
 
     def test_bytes_map_to_base64_string(self):
         assert to_attr(b"\x00\x01") == base64.b64encode(b"\x00\x01").decode()

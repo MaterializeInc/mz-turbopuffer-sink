@@ -61,8 +61,13 @@ class FakeConsumer:
     def resume(self, tps):
         self.paused -= {tp.partition for tp in tps}
 
-    def commit(self, offsets, asynchronous):
-        assert asynchronous is False
+    def commit(self, message=None, offsets=None, asynchronous=True):
+        # mirrors confluent_kafka.Consumer.commit(message=None, offsets=None,
+        # asynchronous=True): a positionally-passed list lands in `message`
+        # and the real client raises TypeError
+        if message is not None:
+            raise TypeError("expected confluent_kafka.cimpl.Message")
+        assert asynchronous is False, "offset commits must be synchronous"
         self.commits.append(list(offsets))
 
     def get_watermark_offsets(self, tp, timeout=None, cached=False):

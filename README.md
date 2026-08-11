@@ -114,32 +114,81 @@ memory is bounded by roughly two transactions per partition.
 | Kafka key: single `string` column | string ID (>64 bytes → deterministic UUIDv5) |
 | Kafka key: single `uuid` logical type | UUID ID |
 | Kafka key: composite | canonical-JSON string ID (>64 bytes → UUIDv5) |
-| `timestamp`/`date`/`time` logical types | ISO-8601 string |
-| `decimal` | string |
-| `bytes` | base64 string |
-| nested records / maps | JSON string |
-| arrays of primitives | arrays |
-| everything else | as-is |
+| `timestamp`/`date`/`time` logical types | `datetime` (sent as ISO-8601) |
+| `decimal` | `float` |
+| `float`/`double` | `float` |
+| `int`/`long` | `int` |
+| `boolean` | `bool` |
+| `bytes` | base64 `string` |
+| nested records / maps | JSON `string` |
+| arrays of primitives | `[]string` / `[]int` / `[]float` / … |
+| arrays of records | JSON `string` |
 
 A value column named `id` is not treated as an attribute; the document ID
-always comes from the Kafka key.
+always comes from the Kafka key. The sink logs a warning once if a value
+column named `id` is dropped because the key column has a different name.
+
+`numeric` becomes a turbopuffer `float`, so range filters and sorting work
+(`["price", "Gt", 10]`). Materialize encodes unconstrained `numeric` as an Avro
+decimal with scale 39, so `9.99` arrives as
+`9.990000000000000000000000000000000000000`; the float conversion drops that
+padding. Values carrying more than 17 significant digits cannot round-trip
+through a float, and the sink warns once when it sees one.
+
+### Attribute schema is declared, not inferred
+
+On startup the sink reads the topic's registered Avro value schema and derives
+an explicit turbopuffer attribute schema from it (logged at INFO), which it
+sends with every write.
+
+This is not an optimization — it is required for correctness. turbopuffer
+otherwise infers each attribute's type from the first value it sees, and an
+integral float is indistinguishable from an integer on the wire: a first row
+with `price = 5.00` pins the attribute to `int`, and the next row's `9.99` is
+then rejected with `number cannot be represented as signed 64-bit integer`,
+stalling the sink. Declaring the type up front also fixes columns whose first
+observed value is `NULL`, which offer nothing to infer from.
 
 ## Development
 
 ```sh
-uv run pytest
+uv run pytest          # unit tests only; no Docker, no network
 ```
 
-The suite covers the completeness rule, backpressure, per-key merging,
-Debezium diffing, ID derivation, chunking, and retry behavior with fakes — no
-network required.
+The unit suite covers the completeness rule, backpressure, per-key merging,
+Debezium diffing, ID derivation, schema derivation, chunking, and retry
+behavior. One test drives the real turbopuffer SDK client over a mock HTTP
+transport so the request shape and URL routing are checked without network
+access.
 
-### Manual end-to-end check
+### End-to-end test
 
-1. Start Materialize (or the emulator) + Redpanda + Schema Registry.
-2. Create a table, a view, and an Avro/Debezium sink as above.
-3. Export the `MZ_TPUF_*` variables (a real `MZ_TPUF_TURBOPUFFER_API_KEY` and
-   namespace) and run `uv run mz-tpuf-sink --log-level DEBUG`.
-4. `INSERT`/`UPDATE`/`DELETE` rows in Materialize inside and outside of
-   explicit transactions; confirm documents appear/patch/disappear in
-   turbopuffer and that multi-row transactions land together.
+`e2e/` runs the whole pipeline — Materialize → Redpanda (Kafka + Schema
+Registry) → this sink → **real turbopuffer**:
+
+```sh
+echo 'MZ_TPUF_TURBOPUFFER_API_KEY=tpuf_...' > e2e/.env   # gitignored
+echo 'MZ_TPUF_TURBOPUFFER_REGION=aws-us-east-1'         >> e2e/.env
+uv run pytest e2e -v -s
+```
+
+It needs Docker, takes about 45 seconds, and is skipped if no API key is
+present. It writes to a throwaway namespace (`mz-tpuf-e2e-<timestamp>`) and
+deletes it afterwards, so it cannot touch existing data.
+
+The topic is deliberately created with **3 partitions** while the test uses
+only a few keys, so at least one partition stays empty — that is what
+exercises frontier-based settlement for idle partitions. The scenario asserts:
+
+1. A multi-row insert lands with correct type mapping.
+2. An update is a genuine **column-level patch**: the test writes a `sidecar`
+   attribute directly to turbopuffer that Materialize knows nothing about, then
+   updates one column and asserts the sidecar survived. A full-row upsert would
+   have destroyed it.
+3. A delete removes exactly one document.
+4. A statement touching two rows produces **one** turbopuffer request carrying
+   two operations (asserted against the sink's own log).
+5. An insert after an idle period still lands promptly, proving empty and idle
+   partitions settle rather than stalling the sink.
+6. Offsets are actually committed to Kafka, so a restart resumes instead of
+   replaying the topic.
