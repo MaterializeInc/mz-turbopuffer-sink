@@ -29,6 +29,8 @@ MZ_DSN = "postgres://materialize@localhost:6875/materialize"
 TOPIC = "products"
 PARTITIONS = 3  # exercises multi-partition + idle/empty-partition settlement
 SINK_NAME = "products_sink"
+# sink names are unique only within a schema, so the sink must be qualified
+QUALIFIED_SINK = f"materialize.public.{SINK_NAME}"
 STRONG = {"level": "strong"}
 
 API_KEY = os.environ.get("MZ_TPUF_TURBOPUFFER_API_KEY")
@@ -89,10 +91,6 @@ def mz_exec(*statements: str) -> None:
 
 @pytest.fixture(scope="module")
 def infra():
-    # Start from a guaranteed-clean slate: a previous run killed mid-flight
-    # leaves the stack up, and the topic and Materialize objects created below
-    # would then already exist.
-    compose("down", "-v", check=False)
     compose("up", "-d", "--wait")
     try:
         wait_for(
@@ -138,16 +136,22 @@ def materialize(infra):
         "(BROKER 'redpanda:9092', SECURITY PROTOCOL PLAINTEXT)",
         "CREATE CONNECTION csr_conn TO CONFLUENT SCHEMA REGISTRY "
         "(URL 'http://redpanda:8081')",
+        # covers every temporal shape Materialize emits: `time` is an untagged
+        # long, `date`/`timestamp` carry logical types, `interval` is a fixed
         "CREATE TABLE products ("
-        "  id bigint, name text, price numeric, in_stock boolean, updated_at timestamp"
+        "  id bigint, name text, price numeric, in_stock boolean,"
+        "  updated_at timestamp, opens_at time, launch_day date, warranty interval"
         ")",
     )
     # seed BEFORE the sink exists so these rows arrive as the snapshot
     mz_exec(
         "INSERT INTO products VALUES "
-        "(1, 'widget', 9.99, true, '2026-01-01 00:00:00'), "
-        "(2, 'gadget', 24.50, true, '2026-01-02 00:00:00'), "
-        "(3, 'doohickey', 5.00, false, '2026-01-03 00:00:00')"
+        "(1, 'widget', 9.99, true, '2026-01-01 00:00:00', '09:30:00', "
+        "  '2026-03-01', INTERVAL '1 year'), "
+        "(2, 'gadget', 24.50, true, '2026-01-02 00:00:00', '10:15:00', "
+        "  '2026-03-02', INTERVAL '6 months'), "
+        "(3, 'doohickey', 5.00, false, '2026-01-03 00:00:00', '11:45:00', "
+        "  '2026-03-03', INTERVAL '30 days')"
     )
     mz_exec(
         f"CREATE SINK {SINK_NAME} FROM products "
@@ -172,7 +176,7 @@ def sink(materialize, namespace_name, group_id, sink_log):
         "MZ_TPUF_KAFKA_GROUP_ID": group_id,
         "MZ_TPUF_SCHEMA_REGISTRY_URL": "http://localhost:8081",
         "MZ_TPUF_MATERIALIZE_DSN": MZ_DSN,
-        "MZ_TPUF_MATERIALIZE_SINK": SINK_NAME,
+        "MZ_TPUF_MATERIALIZE_SINK": QUALIFIED_SINK,
         "MZ_TPUF_TURBOPUFFER_API_KEY": API_KEY,
         "MZ_TPUF_TURBOPUFFER_REGION": REGION,
         "MZ_TPUF_NAMESPACE": namespace_name,
@@ -227,6 +231,14 @@ def test_end_to_end(docs, sink, sink_log, tpuf, group_id):
     assert widget.in_stock is True
     assert widget.price == 9.99  # numeric → float, scale-39 padding dropped
     assert widget.updated_at.startswith("2026-01-01T00:00:00")  # timestamp → ISO
+    # Materialize emits `time` as an untagged long (microseconds since
+    # midnight), so it stays an integer rather than becoming a datetime
+    assert widget.opens_at == 9 * 3600_000_000 + 30 * 60_000_000
+    # `date` does carry a logical type and becomes a real datetime
+    assert widget.launch_day.startswith("2026-03-01T00:00:00")
+    # `interval` is an Avro fixed(16); base64 of its 16 bytes
+    assert isinstance(widget.warranty, str) and len(widget.warranty) == 24
+    assert state[1].id == 1 and isinstance(state[1].id, int)  # uint id declared
     print("\n[stage 1] snapshot of 3 rows landed with correct type mapping")
 
     # -- stage 2: an update is a COLUMN-LEVEL PATCH ------------------------

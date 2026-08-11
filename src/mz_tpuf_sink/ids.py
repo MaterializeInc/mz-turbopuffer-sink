@@ -17,6 +17,13 @@ ID_NAMESPACE_UUID = uuid.uuid5(uuid.NAMESPACE_URL, "mz-tpuf-sink")
 
 _MAX_STRING_ID_BYTES = 64
 
+# Direct and hashed encodings must never overlap. This namespace constant is
+# public, so without disjoint prefixes anyone who controls key values could
+# craft a >64-byte key whose hash equals another row's short key and silently
+# overwrite that document.
+_DIRECT_PREFIX = "k:"
+_HASH_PREFIX = "h:"
+
 
 class IdMode(Enum):
     U64 = "u64"
@@ -33,16 +40,36 @@ def _unwrap_nullable(avro_type: Any) -> Any:
     return avro_type
 
 
-def _string_or_hash(value: str) -> str:
-    if len(value.encode("utf-8")) <= _MAX_STRING_ID_BYTES:
-        return value
-    return str(uuid.uuid5(ID_NAMESPACE_UUID, value))
+def _hashed(value: str) -> str:
+    return _HASH_PREFIX + str(uuid.uuid5(ID_NAMESPACE_UUID, value))
+
+
+def _string_or_hash(value: str, prefix: str = "") -> str:
+    """Encode a string key, hashing it if it would exceed turbopuffer's limit.
+
+    `prefix` separates the direct encoding from the hashed one. Composite keys
+    pass no prefix: their canonical JSON always starts with "{", which already
+    cannot collide with the "h:" hash form.
+    """
+    direct = prefix + value
+    if len(direct.encode("utf-8")) <= _MAX_STRING_ID_BYTES:
+        return direct
+    return _hashed(value)
 
 
 @dataclass(frozen=True)
 class IdCodec:
     mode: IdMode
     field: str | None  # None for JSON mode (uses all key fields)
+
+    @property
+    def tpuf_id_type(self) -> str:
+        """The turbopuffer `id` type to declare for this key encoding."""
+        if self.mode is IdMode.U64:
+            return "uint"
+        if self.mode is IdMode.UUID:
+            return "uuid"
+        return "string"
 
     @classmethod
     def from_key_schema(cls, schema: dict) -> "IdCodec":
@@ -76,6 +103,6 @@ class IdCodec:
         if self.mode is IdMode.UUID:
             return key[self.field]
         if self.mode is IdMode.STRING:
-            return _string_or_hash(key[self.field])
+            return _string_or_hash(key[self.field], _DIRECT_PREFIX)
         canonical = json.dumps(key, sort_keys=True, separators=(",", ":"), default=str)
         return _string_or_hash(canonical)

@@ -8,7 +8,7 @@ REQUIRED = {
     "MZ_TPUF_KAFKA_TOPIC": "events",
     "MZ_TPUF_SCHEMA_REGISTRY_URL": "http://localhost:8081",
     "MZ_TPUF_MATERIALIZE_DSN": "postgres://materialize@localhost:6875/materialize",
-    "MZ_TPUF_MATERIALIZE_SINK": "events_sink",
+    "MZ_TPUF_MATERIALIZE_SINK": "materialize.public.events_sink",
     "MZ_TPUF_TURBOPUFFER_API_KEY": "tpuf-key",
     "MZ_TPUF_NAMESPACE": "events",
 }
@@ -25,7 +25,31 @@ class TestSettings:
         settings = Settings()
         assert settings.kafka_topic == "events"
         assert settings.namespace == "events"
-        assert settings.materialize_sink == "events_sink"
+        assert settings.materialize_sink == "materialize.public.events_sink"
+
+
+class TestSinkNameQualification:
+    """A bare sink name is ambiguous across schemas, so the fully qualified
+    database.schema.sink form is required."""
+
+    def test_parts_are_split(self, monkeypatch):
+        set_required(monkeypatch)
+        settings = Settings()
+        assert settings.sink_parts == ("materialize", "public", "events_sink")
+
+    @pytest.mark.parametrize(
+        "value", ["events_sink", "public.events_sink", "a.b.c.d", "a..c", ".b.c", ""]
+    )
+    def test_unqualified_or_malformed_names_rejected(self, monkeypatch, value):
+        set_required(monkeypatch)
+        monkeypatch.setenv("MZ_TPUF_MATERIALIZE_SINK", value)
+        with pytest.raises(ValidationError, match="database.schema.sink"):
+            Settings()
+
+    def test_whitespace_is_trimmed(self, monkeypatch):
+        set_required(monkeypatch)
+        monkeypatch.setenv("MZ_TPUF_MATERIALIZE_SINK", " db . sch . snk ")
+        assert Settings().sink_parts == ("db", "sch", "snk")
 
     def test_sensible_defaults(self, monkeypatch):
         set_required(monkeypatch)

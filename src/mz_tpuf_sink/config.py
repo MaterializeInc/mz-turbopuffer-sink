@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,7 +20,10 @@ class Settings(BaseSettings):
 
     # Materialize (for frontier tracking)
     materialize_dsn: str
-    materialize_sink: str  # sink name as it appears in mz_sinks.name
+    # Fully qualified as database.schema.sink. Sink names are unique only
+    # within a schema, so a bare name could match sinks in several schemas and
+    # mix their frontiers together.
+    materialize_sink: str
 
     # turbopuffer
     turbopuffer_api_key: str
@@ -33,3 +37,20 @@ class Settings(BaseSettings):
     buffer_warn_bytes: int = 1024 * 1024 * 1024
     poll_timeout: float = 1.0
     frontier_ready_timeout: float = 15.0
+
+    @field_validator("materialize_sink")
+    @classmethod
+    def _require_qualified_sink(cls, value: str) -> str:
+        parts = [part.strip() for part in value.split(".")]
+        if len(parts) != 3 or not all(parts):
+            raise ValueError(
+                f"materialize_sink must be fully qualified as "
+                f"database.schema.sink (got {value!r})"
+            )
+        return ".".join(parts)
+
+    @property
+    def sink_parts(self) -> tuple[str, str, str]:
+        """The sink's database, schema, and name."""
+        database, schema, name = self.materialize_sink.split(".")
+        return database, schema, name

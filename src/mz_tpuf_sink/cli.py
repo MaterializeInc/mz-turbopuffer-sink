@@ -45,7 +45,8 @@ def build_sink(settings: Settings) -> Sink:
         f"{settings.kafka_topic}-value"
     ).schema.schema_str
     tpuf_schema = turbopuffer_schema(
-        row_schema_from_envelope(json.loads(value_schema))
+        row_schema_from_envelope(json.loads(value_schema)),
+        id_type=codec.tpuf_id_type,
     )
     logger.info(
         "turbopuffer attribute schema: %s",
@@ -58,6 +59,11 @@ def build_sink(settings: Settings) -> Sink:
             "group.id": settings.kafka_group_id,
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
+            # Materialize writes its sink topic with Kafka transactions.
+            # librdkafka already defaults to read_committed (unlike the Java
+            # client), but state would be corrupted by aborted records if that
+            # ever changed, so pin it.
+            "isolation.level": "read_committed",
         }
     )
 
@@ -69,9 +75,13 @@ def build_sink(settings: Settings) -> Sink:
     if settings.turbopuffer_base_url:
         tpuf_kwargs["base_url"] = settings.turbopuffer_base_url
 
+    database_name, schema_name, sink_name = settings.sink_parts
     frontier = FrontierWatcher(
         connect=lambda: psycopg.connect(settings.materialize_dsn, autocommit=True),
-        sink_name=settings.materialize_sink,
+        database_name=database_name,
+        schema_name=schema_name,
+        sink_name=sink_name,
+        topic=settings.kafka_topic,
     )
 
     return Sink(

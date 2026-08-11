@@ -31,6 +31,11 @@ Registry. Every Avro field maps to a turbopuffer attribute.
     ENVELOPE DEBEZIUM;
   ```
 
+  Configure it as `MZ_TPUF_MATERIALIZE_SINK=materialize.public.events_sink`.
+  The sink is looked up by database, schema, name, **and** topic, so a name
+  that resolves to a sink writing somewhere else fails at startup instead of
+  tracking the wrong frontier.
+
 - A SQL connection to the same Materialize instance (used only to `SUBSCRIBE`
   to the sink's write frontier).
 
@@ -51,7 +56,7 @@ Configuration is environment variables (or a `.env` file):
 | `MZ_TPUF_SCHEMA_REGISTRY_URL` | yes | | Confluent Schema Registry URL |
 | `MZ_TPUF_SCHEMA_REGISTRY_AUTH` | | | `user:password` for the registry |
 | `MZ_TPUF_MATERIALIZE_DSN` | yes | | e.g. `postgres://materialize@localhost:6875/materialize` |
-| `MZ_TPUF_MATERIALIZE_SINK` | yes | | Sink name as it appears in `mz_sinks.name` |
+| `MZ_TPUF_MATERIALIZE_SINK` | yes | | Sink, fully qualified as `database.schema.sink` |
 | `MZ_TPUF_TURBOPUFFER_API_KEY` | yes | | turbopuffer API key |
 | `MZ_TPUF_TURBOPUFFER_REGION` | | | turbopuffer region (e.g. `gcp-us-central1`) |
 | `MZ_TPUF_TURBOPUFFER_BASE_URL` | | | Overrides region; useful for testing |
@@ -103,6 +108,11 @@ memory is bounded by roughly two transactions per partition.
 - **Single writer.** Run one instance per consumer group/namespace. turbopuffer
   has no request-level compare-and-swap, so concurrent writers to the same
   namespace are not fenced.
+- **Committed records only.** Materialize writes its sink topic using Kafka
+  transactions, so the consumer pins `isolation.level=read_committed` and never
+  applies records from aborted transactions. (librdkafka already defaults to
+  `read_committed`, unlike the Java client, but the sink sets it explicitly
+  rather than depending on that.)
 - On rebalance, all buffered state is dropped and uncommitted messages are
   redelivered, so a stale consumer can never overwrite newer writes.
 
@@ -110,11 +120,13 @@ memory is bounded by roughly two transactions per partition.
 
 | Source | turbopuffer |
 | --- | --- |
-| Kafka key: single `int`/`long` column | u64 ID (negative values are an error) |
-| Kafka key: single `string` column | string ID (>64 bytes → deterministic UUIDv5) |
-| Kafka key: single `uuid` logical type | UUID ID |
-| Kafka key: composite | canonical-JSON string ID (>64 bytes → UUIDv5) |
-| `timestamp`/`date`/`time` logical types | `datetime` (sent as ISO-8601) |
+| Kafka key: single `int`/`long` column | `uint` ID (negative values are an error) |
+| Kafka key: single `string` column | `k:<key>` string ID, or `h:<uuidv5>` if too long |
+| Kafka key: single `uuid` logical type | `uuid` ID |
+| Kafka key: composite | canonical-JSON string ID, or `h:<uuidv5>` if too long |
+| `timestamp`/`timestamptz`/`date` | `datetime` (sent as ISO-8601) |
+| `time` | `int` (Materialize sends an untagged microsecond count) |
+| `interval` | base64 `string` (Avro `fixed`) |
 | `decimal` | `float` |
 | `float`/`double` | `float` |
 | `int`/`long` | `int` |
@@ -128,6 +140,15 @@ A value column named `id` is not treated as an attribute; the document ID
 always comes from the Kafka key. The sink logs a warning once if a value
 column named `id` is dropped because the key column has a different name.
 
+String document IDs carry a one-character namespace: a key used directly
+becomes `k:<key>`, and a key too long for turbopuffer's 64-byte limit becomes
+`h:<uuidv5>`. The two forms must not overlap — the hash namespace is a public
+constant, so without the prefixes anyone able to choose key values could craft
+an over-long key whose hash equals another row's short key and overwrite that
+document. The prefix costs two bytes, so keys up to 62 bytes are stored
+directly. Composite keys need no prefix: their canonical JSON always starts
+with `{`.
+
 `numeric` becomes a turbopuffer `float`, so range filters and sorting work
 (`["price", "Gt", 10]`). Materialize encodes unconstrained `numeric` as an Avro
 decimal with scale 39, so `9.99` arrives as
@@ -139,7 +160,8 @@ through a float, and the sink warns once when it sees one.
 
 On startup the sink reads the topic's registered Avro value schema and derives
 an explicit turbopuffer attribute schema from it (logged at INFO), which it
-sends with every write.
+sends with every write. The document `id` type is declared too, so a UUID key
+is stored as a UUID rather than inferred as a string.
 
 This is not an optimization — it is required for correctness. turbopuffer
 otherwise infers each attribute's type from the first value it sees, and an

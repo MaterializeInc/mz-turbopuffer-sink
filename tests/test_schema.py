@@ -99,10 +99,26 @@ class TestTurbopufferSchema:
             "updated_at": {"type": "datetime"},
         }
 
-    def test_id_is_excluded(self):
+    def test_value_id_column_is_never_an_attribute(self):
         # turbopuffer's id is the document key, never an attribute
         schema = turbopuffer_schema(row_schema_from_envelope(REAL_ENVELOPE))
         assert "id" not in schema
+
+    def test_id_type_declared_when_given(self):
+        schema = turbopuffer_schema(
+            row_schema_from_envelope(REAL_ENVELOPE), id_type="uint"
+        )
+        assert schema["id"] == {"type": "uint"}
+
+    def test_declared_id_type_wins_over_value_column(self):
+        # the document id comes from the Kafka key, so a value column named
+        # "id" must never define the id type
+        row = {
+            "type": "record",
+            "name": "row",
+            "fields": [{"name": "id", "type": "string"}],
+        }
+        assert turbopuffer_schema(row, id_type="uuid") == {"id": {"type": "uuid"}}
 
     def test_integer_types(self):
         row = {
@@ -132,7 +148,7 @@ class TestTurbopufferSchema:
             "b": {"type": "float"},
         }
 
-    def test_date_and_time_logical_types_are_datetime(self):
+    def test_date_and_timestamp_are_datetime(self):
         row = {
             "type": "record",
             "name": "row",
@@ -147,6 +163,26 @@ class TestTurbopufferSchema:
         assert turbopuffer_schema(row) == {
             "d": {"type": "datetime"},
             "ts": {"type": "datetime"},
+        }
+
+    def test_time_of_day_is_string_not_datetime(self):
+        # a SQL `time` has no date, and to_attr renders it as "12:34:56";
+        # turbopuffer rejects that for a datetime attribute with
+        # "failed to parse as DateTime: ... not enough information"
+        row = {
+            "type": "record",
+            "name": "row",
+            "fields": [
+                {"name": "t_ms", "type": {"type": "int", "logicalType": "time-millis"}},
+                {
+                    "name": "t_us",
+                    "type": {"type": "long", "logicalType": "time-micros"},
+                },
+            ],
+        }
+        assert turbopuffer_schema(row) == {
+            "t_ms": {"type": "string"},
+            "t_us": {"type": "string"},
         }
 
     def test_plain_bytes_is_string(self):

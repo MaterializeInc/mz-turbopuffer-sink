@@ -31,13 +31,17 @@ _PRIMITIVE_TYPES = {
 
 _DATE_TIME_LOGICAL_TYPES = {
     "date",
-    "time-millis",
-    "time-micros",
     "timestamp-millis",
     "timestamp-micros",
     "local-timestamp-millis",
     "local-timestamp-micros",
 }
+
+# turbopuffer's datetime requires a date component. A SQL `time` has none —
+# to_attr renders it as "12:34:56", which turbopuffer rejects with "failed to
+# parse as DateTime" — so time-of-day is stored as a string. The underlying
+# Avro type is int/long, so this must be explicit or it would map to `int`.
+_TIME_OF_DAY_LOGICAL_TYPES = {"time-millis", "time-micros"}
 
 
 def _unwrap_nullable(avro_type: Any) -> Any:
@@ -77,6 +81,8 @@ def _attribute_type(avro_type: Any) -> str:
         logical = avro_type.get("logicalType")
         if logical in _DATE_TIME_LOGICAL_TYPES:
             return "datetime"
+        if logical in _TIME_OF_DAY_LOGICAL_TYPES:
+            return "string"
         if logical == "decimal":
             return "float"  # to_attr converts Decimal to float
         if logical == "uuid":
@@ -98,13 +104,20 @@ def _attribute_type(avro_type: Any) -> str:
     return "string"
 
 
-def turbopuffer_schema(row_schema: dict) -> dict[str, dict[str, str]]:
+def turbopuffer_schema(
+    row_schema: dict, id_type: str | None = None
+) -> dict[str, dict[str, str]]:
     """Map an Avro row record to turbopuffer attribute type declarations.
 
-    `id` is omitted: it is turbopuffer's document key, not an attribute.
+    A value column named `id` is dropped: the document id comes from the Kafka
+    key. When `id_type` is given it is declared explicitly, so a UUID key is
+    stored as a UUID rather than inferred as a string.
     """
-    return {
+    schema = {
         field["name"]: {"type": _attribute_type(field["type"])}
         for field in row_schema.get("fields", [])
         if field["name"] != "id"
     }
+    if id_type is not None:
+        schema["id"] = {"type": id_type}
+    return schema

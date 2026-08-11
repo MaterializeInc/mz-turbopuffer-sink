@@ -25,22 +25,52 @@ class TestSingleIntegerKey:
 
 
 class TestSingleStringKey:
-    def test_short_string_used_directly(self):
-        codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
-        assert codec.encode({"id": "user-1"}) == "user-1"
+    """Direct and hashed encodings must occupy disjoint spaces.
 
-    def test_string_over_64_bytes_hashed_to_uuid5(self):
+    Both are prefixed so no hashed value can ever equal a raw key: the hash
+    namespace is a published constant, so with user-controlled keys an
+    unprefixed scheme lets someone craft a long key whose hash equals another
+    row's short key and overwrite that document.
+    """
+
+    def test_short_string_is_prefixed(self):
+        codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
+        assert codec.encode({"id": "user-1"}) == "k:user-1"
+
+    def test_long_string_is_hashed_with_distinct_prefix(self):
         codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
         long_key = "x" * 65
-        expected = str(uuid.uuid5(ID_NAMESPACE_UUID, long_key))
-        assert codec.encode({"id": long_key}) == expected
+        assert codec.encode({"id": long_key}) == "h:" + str(
+            uuid.uuid5(ID_NAMESPACE_UUID, long_key)
+        )
 
-    def test_64_byte_boundary_measured_in_bytes_not_chars(self):
+    def test_hash_of_long_key_cannot_collide_with_a_short_key(self):
         codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
-        # 33 two-byte chars = 66 bytes but only 33 chars
-        multibyte = "é" * 33
-        expected = str(uuid.uuid5(ID_NAMESPACE_UUID, multibyte))
-        assert codec.encode({"id": multibyte}) == expected
+        long_key = "x" * 65
+        colliding_short_key = str(uuid.uuid5(ID_NAMESPACE_UUID, long_key))
+        assert codec.encode({"id": long_key}) != codec.encode(
+            {"id": colliding_short_key}
+        )
+
+    def test_boundary_measured_in_bytes_after_prefixing(self):
+        codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
+        # 62 raw bytes + "k:" == exactly the 64-byte limit
+        at_limit = "x" * 62
+        assert codec.encode({"id": at_limit}) == "k:" + at_limit
+        over = "x" * 63
+        assert codec.encode({"id": over}).startswith("h:")
+
+    def test_multibyte_boundary_counts_bytes_not_chars(self):
+        codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
+        multibyte = "é" * 33  # 66 bytes, 33 chars
+        assert codec.encode({"id": multibyte}) == "h:" + str(
+            uuid.uuid5(ID_NAMESPACE_UUID, multibyte)
+        )
+
+    def test_every_encoded_id_fits_turbopuffer_limit(self):
+        codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "string"}]))
+        for key in ("a", "x" * 62, "x" * 63, "x" * 500, "é" * 40):
+            assert len(codec.encode({"id": key}).encode("utf-8")) <= 64
 
 
 class TestUuidKey:
@@ -77,15 +107,53 @@ class TestCompositeKey:
         )
         codec = IdCodec.from_key_schema(schema)
         payload = {"b": "y" * 100, "a": 2}
-        expected = str(uuid.uuid5(ID_NAMESPACE_UUID, '{"a":2,"b":"' + "y" * 100 + '"}'))
+        expected = "h:" + str(
+            uuid.uuid5(ID_NAMESPACE_UUID, '{"a":2,"b":"' + "y" * 100 + '"}')
+        )
         assert codec.encode(payload) == expected
+
+    def test_composite_direct_form_cannot_collide_with_a_hash(self):
+        # canonical JSON always starts with "{", the hash form with "h:"
+        schema = record_schema(
+            [{"name": "a", "type": "long"}, {"name": "b", "type": "string"}]
+        )
+        codec = IdCodec.from_key_schema(schema)
+        assert codec.encode({"a": 1, "b": "x"}).startswith("{")
+        assert codec.encode({"a": 1, "b": "y" * 100}).startswith("h:")
 
 
 class TestUnionUnwrapping:
     def test_nullable_union_is_unwrapped(self):
+        # Materialize registers every key column as ["null", <type>]
         schema = record_schema([{"name": "id", "type": ["null", "string"]}])
         codec = IdCodec.from_key_schema(schema)
-        assert codec.encode({"id": "k"}) == "k"
+        assert codec.encode({"id": "k"}) == "k:k"
+
+
+class TestTurbopufferIdType:
+    """The id type is declared explicitly rather than left to inference."""
+
+    def test_integer_key_declares_uint(self):
+        codec = IdCodec.from_key_schema(record_schema([{"name": "id", "type": "long"}]))
+        assert codec.tpuf_id_type == "uint"
+
+    def test_uuid_key_declares_uuid(self):
+        schema = record_schema(
+            [{"name": "id", "type": {"type": "string", "logicalType": "uuid"}}]
+        )
+        assert IdCodec.from_key_schema(schema).tpuf_id_type == "uuid"
+
+    def test_string_key_declares_string(self):
+        codec = IdCodec.from_key_schema(
+            record_schema([{"name": "id", "type": "string"}])
+        )
+        assert codec.tpuf_id_type == "string"
+
+    def test_composite_key_declares_string(self):
+        schema = record_schema(
+            [{"name": "a", "type": "long"}, {"name": "b", "type": "string"}]
+        )
+        assert IdCodec.from_key_schema(schema).tpuf_id_type == "string"
 
 
 class TestSchemaValidation:
