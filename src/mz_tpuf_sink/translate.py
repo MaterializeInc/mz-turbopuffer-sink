@@ -8,11 +8,14 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import json
+import logging
 from decimal import Decimal
 from typing import Any
 
 from .ids import IdCodec
 from .models import ChangeEvent, Delete, Op, Patch, Upsert
+
+logger = logging.getLogger(__name__)
 
 
 def to_attr(value: Any) -> Any:
@@ -35,8 +38,22 @@ def to_attr(value: Any) -> Any:
 class Translator:
     def __init__(self, codec: IdCodec):
         self._codec = codec
+        self._warned_id_column = False
+
+    def _warn_dropped_id(self, row: dict[str, Any]) -> None:
+        # "id" is turbopuffer's reserved document-ID field; a value column
+        # by that name is representable only when it IS the key column
+        if self._warned_id_column or "id" not in row or self._codec.field == "id":
+            return
+        self._warned_id_column = True
+        logger.warning(
+            'value column "id" is dropped: the document ID comes from the '
+            "Kafka key (%s), and turbopuffer reserves the \"id\" field",
+            self._codec.field or "composite key",
+        )
 
     def translate(self, event: ChangeEvent) -> Op | None:
+        self._warn_dropped_id(event.after or event.before or {})
         doc_id = self._codec.encode(event.key)
 
         if event.after is not None and event.before is None:

@@ -30,4 +30,6 @@ class Settings(BaseSettings):
     # Tuning
     max_rows_per_request: int = 10_000
     max_bytes_per_request: int = 200 * 1024 * 1024
+    buffer_warn_bytes: int = 1024 * 1024 * 1024
     poll_timeout: float = 1.0
+    frontier_ready_timeout: float = 15.0

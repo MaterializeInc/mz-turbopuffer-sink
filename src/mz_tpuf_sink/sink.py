@@ -43,6 +43,8 @@ class Sink:
         self._offsets: dict[int, dict[int, int]] = {}  # partition -> ts -> last offset
         self._paused: set[int] = set()
         self._stopped = threading.Event()
+        self._idle = True
+        self._last_probed_frontier: int | None = None
 
     # -- rebalance callbacks -------------------------------------------------
 
@@ -69,6 +71,7 @@ class Sink:
 
     def _consume_one(self) -> None:
         msg = self.consumer.poll(self.poll_timeout)
+        self._idle = msg is None
         if msg is None:
             return
         if msg.error():
@@ -83,25 +86,54 @@ class Sink:
             self.buffer.add(event.ts, op)
 
     def _settle_idle_partitions(self) -> None:
-        """Apply completeness rule (b): frontier + caught-up-to-watermark."""
+        """Apply completeness rule (b): frontier + caught-up-to-watermark.
+
+        Watermark probes are broker RPCs, so probe only when it can change the
+        outcome: the frontier advanced, or the consumer went idle.
+        """
         frontier = self.frontier.current()
-        if frontier is None or not self.buffer.has_pending():
+        if frontier is None:
             return
+        if not self.buffer.has_pending() and not self._offsets:
+            return
+        if not self._idle and frontier == self._last_probed_frontier:
+            return
+        self._last_probed_frontier = frontier
         for partition in self.buffer.assigned:
+            if self.buffer.settled_past(partition, frontier):
+                continue  # rule (a) already covers this partition
             tp = TopicPartition(self.topic, partition)
-            _, high = self.consumer.get_watermark_offsets(tp)
-            position = self.consumer.position([tp])[0].offset
-            if position >= high:
+            try:
+                watermarks = self.consumer.get_watermark_offsets(tp, timeout=5.0)
+            except Exception as exc:
+                logger.warning("watermark probe failed for partition %d: %s", partition, exc)
+                continue
+            if watermarks is None:
+                continue
+            low, high = watermarks
+            if self._effective_position(tp, low) >= high:
                 self.buffer.settle_watermark(partition, frontier)
+
+    def _effective_position(self, tp: TopicPartition, low: int) -> int:
+        """The next offset this consumer would read from `tp`.
+
+        `position()` is OFFSET_INVALID (-1001) until the first message of the
+        session; fall back to the committed offset, then to the low watermark
+        (an empty partition is trivially caught up).
+        """
+        position = self.consumer.position([tp])[0].offset
+        if position >= 0:
+            return position
+        committed = self.consumer.committed([tp], timeout=5.0)[0].offset
+        return committed if committed >= 0 else low
 
     def _flush_complete(self) -> None:
         bound = self.buffer.completeness_bound()
-        flushable = self.buffer.take_flushable()
-        if not flushable:
-            return
-        for ts, ops in flushable:
+        for ts, ops in self.buffer.take_flushable():
             logger.info("writing transaction ts=%d (%d ops)", ts, len(ops))
             self.writer.write_transaction(ops)
+        # commit even when nothing was written: a complete timestamp may
+        # consist entirely of no-change updates
         self._commit_offsets(bound)
 
     def _commit_offsets(self, bound: float) -> None:

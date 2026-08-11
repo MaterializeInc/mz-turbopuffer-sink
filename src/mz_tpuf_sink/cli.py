@@ -46,7 +46,9 @@ def build_sink(settings: Settings) -> Sink:
         }
     )
 
-    tpuf_kwargs = {"api_key": settings.turbopuffer_api_key}
+    # the Writer owns retry policy; disable the SDK's built-in retries so the
+    # two layers don't multiply
+    tpuf_kwargs = {"api_key": settings.turbopuffer_api_key, "max_retries": 0}
     if settings.turbopuffer_region:
         tpuf_kwargs["region"] = settings.turbopuffer_region
     if settings.turbopuffer_base_url:
@@ -65,7 +67,7 @@ def build_sink(settings: Settings) -> Sink:
             value_deserializer=AvroDeserializer(schema_registry),
         ),
         translator=Translator(codec),
-        buffer=TransactionBuffer(),
+        buffer=TransactionBuffer(warn_bytes=settings.buffer_warn_bytes),
         writer=Writer(
             Turbopuffer(**tpuf_kwargs),
             namespace=settings.namespace,
@@ -96,6 +98,7 @@ def main(log_level: str) -> None:
         signal.signal(sig, lambda *_: sink.stop())
 
     sink.frontier.start()
+    sink.frontier.wait_ready(settings.frontier_ready_timeout)
     logger.info(
         "sinking topic %r into turbopuffer namespace %r",
         settings.kafka_topic,

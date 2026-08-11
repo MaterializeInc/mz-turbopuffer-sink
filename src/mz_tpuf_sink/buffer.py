@@ -15,18 +15,25 @@ it belongs in `pause_set()` until flushing catches up.
 
 from __future__ import annotations
 
-from .models import Delete, DocId, Op, Patch, Upsert
+import logging
+
+from .models import Delete, DocId, Op, Patch, Upsert, op_size_bytes
+
+logger = logging.getLogger(__name__)
 
 _NEG_INF = float("-inf")
 
 
 class TransactionBuffer:
-    def __init__(self) -> None:
+    def __init__(self, warn_bytes: int = 1024 * 1024 * 1024) -> None:
         self._assigned: set[int] = set()
         self._ops: dict[int, dict[DocId, Op]] = {}
         self._max_seen: dict[int, int] = {}
         self._watermark_bound: dict[int, int] = {}
         self._partition_ts: dict[int, set[int]] = {}
+        self._warn_bytes = warn_bytes
+        self._buffered_bytes = 0
+        self._warned = False
 
     def clear(self) -> None:
         """Drop all buffered data and settlement state (e.g. on rebalance)."""
@@ -34,6 +41,8 @@ class TransactionBuffer:
         self._max_seen.clear()
         self._watermark_bound.clear()
         self._partition_ts.clear()
+        self._buffered_bytes = 0
+        self._warned = False
 
     @property
     def assigned(self) -> set[int]:
@@ -72,6 +81,28 @@ class TransactionBuffer:
             by_id[op.id] = Patch(id=op.id, columns={**prior.columns, **op.columns})
         else:
             by_id[op.id] = op
+        if prior is not None:
+            self._buffered_bytes -= op_size_bytes(prior)
+        self._buffered_bytes += op_size_bytes(by_id[op.id])
+        if self._buffered_bytes > self._warn_bytes and not self._warned:
+            self._warned = True
+            logger.warning(
+                "buffered transactions exceed %d bytes (%d buffered); a very "
+                "large transaction (e.g. the initial snapshot) must be held in "
+                "memory until complete",
+                self._warn_bytes,
+                self._buffered_bytes,
+            )
+
+    def settled_past(self, partition: int, frontier: int) -> bool:
+        """True if this partition is already known-complete up to `frontier`."""
+        return (
+            max(
+                self._max_seen.get(partition, _NEG_INF),
+                self._watermark_bound.get(partition, _NEG_INF),
+            )
+            >= frontier
+        )
 
     def completeness_bound(self) -> float:
         """Every buffered ts strictly below this bound is complete."""
@@ -92,6 +123,10 @@ class TransactionBuffer:
         result = [(ts, list(self._ops.pop(ts).values())) for ts in flush_ts]
         for observed in self._partition_ts.values():
             observed -= {ts for ts in observed if ts < bound}
+        for _, ops in result:
+            self._buffered_bytes -= sum(op_size_bytes(op) for op in ops)
+        if self._buffered_bytes <= self._warn_bytes:
+            self._warned = False
         return result
 
     def pause_set(self) -> set[int]:

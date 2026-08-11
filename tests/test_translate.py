@@ -63,6 +63,30 @@ class TestEnvelopeTranslation:
         op = self.translator.translate(event({"id": 1, "n": 2}, {"id": 1, "n": 3}))
         assert op == Patch(id=1, columns={"n": 3})
 
+    def test_warns_once_when_dropping_unrelated_id_column(self, caplog):
+        # key field is "user_id" but the value has its own "id" column, which
+        # is silently unrepresentable in turbopuffer: warn the operator once
+        import logging
+
+        codec = IdCodec.from_key_schema(
+            {"type": "record", "name": "k", "fields": [{"name": "user_id", "type": "long"}]}
+        )
+        translator = Translator(codec)
+        with caplog.at_level(logging.WARNING):
+            for offset in range(2):
+                translator.translate(
+                    ChangeEvent(
+                        key={"user_id": 5},
+                        before=None,
+                        after={"user_id": 5, "id": 99},
+                        ts=100,
+                        partition=0,
+                        offset=offset,
+                    )
+                )
+        warnings = [r for r in caplog.records if '"id"' in r.message]
+        assert len(warnings) == 1
+
 
 class TestTypeMapping:
     def test_datetime_maps_to_iso_string(self):

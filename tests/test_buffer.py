@@ -158,6 +158,32 @@ class TestBackpressure:
         assert buf.pause_set() == {0}
 
 
+class TestBufferedBytesWarning:
+    def test_warns_once_when_crossing_high_water_mark(self, caplog):
+        import logging
+
+        buf = TransactionBuffer(warn_bytes=50)
+        buf.set_assignment([0])
+        with caplog.at_level(logging.WARNING):
+            buf.add(100, Upsert(id=1, row={"id": 1, "blob": "x" * 100}))
+            buf.add(100, Upsert(id=2, row={"id": 2, "blob": "x" * 100}))
+        warnings = [r for r in caplog.records if "buffered" in r.message]
+        assert len(warnings) == 1
+
+    def test_warns_again_after_draining(self, caplog):
+        import logging
+
+        buf = TransactionBuffer(warn_bytes=50)
+        buf.set_assignment([0])
+        with caplog.at_level(logging.WARNING):
+            buf.add(100, Upsert(id=1, row={"id": 1, "blob": "x" * 100}))
+            buf.settle_watermark(0, 500)
+            buf.take_flushable()
+            buf.add(600, Upsert(id=2, row={"id": 2, "blob": "x" * 100}))
+        warnings = [r for r in caplog.records if "buffered" in r.message]
+        assert len(warnings) == 2
+
+
 class TestRebalance:
     def test_clear_drops_all_buffered_state(self):
         buf = make_buffer([0])

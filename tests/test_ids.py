@@ -52,6 +52,15 @@ class TestUuidKey:
         value = "9f1c1f6e-0b1a-4a5e-8f3d-2f6a1c9b7d10"
         assert codec.encode({"id": value}) == value
 
+    def test_uuid_instance_passes_through(self):
+        # fastavro decodes the uuid logicalType to uuid.UUID instances
+        schema = record_schema(
+            [{"name": "id", "type": {"type": "string", "logicalType": "uuid"}}]
+        )
+        codec = IdCodec.from_key_schema(schema)
+        value = uuid.UUID("9f1c1f6e-0b1a-4a5e-8f3d-2f6a1c9b7d10")
+        assert codec.encode({"id": value}) == value
+
 
 class TestCompositeKey:
     def test_composite_key_becomes_canonical_json(self):

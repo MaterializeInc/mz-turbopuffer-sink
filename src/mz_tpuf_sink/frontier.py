@@ -61,23 +61,47 @@ class FrontierWatcher:
         self._backoff_seconds = backoff_seconds
         self._state = FrontierState()
         self._stopped = threading.Event()
+        self._ready = threading.Event()
         self._thread: threading.Thread | None = None
+        self._conn: Any | None = None
 
     def current(self) -> int | None:
         return self._state.current()
 
+    def wait_ready(self, timeout: float) -> None:
+        """Block until the SUBSCRIBE has produced at least one row.
+
+        A sink that exists always snapshots one row immediately, so a timeout
+        here almost always means the configured sink name is wrong.
+        """
+        if not self._ready.wait(timeout):
+            raise RuntimeError(
+                f"no frontier row for sink {self._sink_name!r} after {timeout}s; "
+                "check that the sink name matches mz_sinks.name"
+            )
+
     def run_once(self) -> None:
         """One connect-and-stream cycle; raises on failure (caller retries)."""
         conn = self._connect()
+        self._conn = conn
         try:
             with conn.cursor() as cur:
                 for row in cur.stream(SUBSCRIBE_SQL, {"sink_name": self._sink_name}):
                     # row: (mz_timestamp, mz_diff, write_frontier)
                     _, diff, write_frontier = row
+                    self._ready.set()
+                    if write_frontier is None:
+                        # empty frontier: the sink is gone or finished
+                        logger.error(
+                            "sink %r has an empty write frontier; was it dropped?",
+                            self._sink_name,
+                        )
+                        continue
                     self._state.apply(write_frontier, int(diff))
                     if self._stopped.is_set():
                         return
         finally:
+            self._conn = None
             conn.close()
 
     def _run(self) -> None:
@@ -102,3 +126,9 @@ class FrontierWatcher:
 
     def stop(self) -> None:
         self._stopped.set()
+        conn = self._conn
+        if conn is not None:
+            try:
+                conn.close()  # interrupts a blocked stream()
+            except Exception:
+                pass

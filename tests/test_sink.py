@@ -31,13 +31,19 @@ class PassthroughDecoder:
         return msg.event
 
 
+OFFSET_INVALID = -1001
+
+
 class FakeConsumer:
-    def __init__(self, messages, high_watermarks=None):
+    def __init__(self, messages, high_watermarks=None, committed_offsets=None):
         self.queue = list(messages)
         self.paused = set()
         self.commits = []
         self.closed = False
         self.high_watermarks = high_watermarks or {}
+        self.low_watermarks = {}
+        self.committed_offsets = committed_offsets or {}
+        self.watermark_calls = 0
         self._positions = {}
 
     def poll(self, timeout):
@@ -59,12 +65,29 @@ class FakeConsumer:
         assert asynchronous is False
         self.commits.append(list(offsets))
 
-    def get_watermark_offsets(self, tp, timeout=None):
-        return (0, self.high_watermarks.get(tp.partition, 0))
+    def get_watermark_offsets(self, tp, timeout=None, cached=False):
+        self.watermark_calls += 1
+        return (
+            self.low_watermarks.get(tp.partition, 0),
+            self.high_watermarks.get(tp.partition, 0),
+        )
 
     def position(self, tps):
+        # honest: OFFSET_INVALID until a message is consumed in this session
         return [
-            TopicPartition(TOPIC, tp.partition, self._positions.get(tp.partition, 0))
+            TopicPartition(
+                TOPIC, tp.partition, self._positions.get(tp.partition, OFFSET_INVALID)
+            )
+            for tp in tps
+        ]
+
+    def committed(self, tps, timeout=None):
+        return [
+            TopicPartition(
+                TOPIC,
+                tp.partition,
+                self.committed_offsets.get(tp.partition, OFFSET_INVALID),
+            )
             for tp in tps
         ]
 
@@ -166,6 +189,47 @@ class TestFlushViaFrontier:
         assert len(writer.transactions) == 1
         assert consumer.commits == [[TopicPartition(TOPIC, 0, 1)]]
 
+    def test_empty_partition_settles_without_ever_consuming(self):
+        # partition 1 has never had a message (low == high == 0) and nothing
+        # was ever consumed from it; it must not block flushing forever
+        frontier = FakeFrontier(150)
+        consumer = FakeConsumer(
+            [FakeMessage(make_event(100, 0))], high_watermarks={0: 1, 1: 0}
+        )
+        writer = RecordingWriter()
+        sink = make_sink(consumer, writer, frontier, partitions=(0, 1))
+        sink.run_iteration()
+        sink.run_iteration()
+        assert len(writer.transactions) == 1
+
+    def test_restart_idle_partition_settles_via_committed_offset(self):
+        # after a restart, position is OFFSET_INVALID until the first message;
+        # the committed offset (== high watermark) proves we are caught up
+        frontier = FakeFrontier(150)
+        consumer = FakeConsumer(
+            [FakeMessage(make_event(100, 5))],
+            high_watermarks={0: 6, 1: 4},
+            committed_offsets={1: 4},
+        )
+        writer = RecordingWriter()
+        sink = make_sink(consumer, writer, frontier, partitions=(0, 1))
+        sink.run_iteration()
+        sink.run_iteration()
+        assert len(writer.transactions) == 1
+
+    def test_never_consumed_partition_with_data_does_not_settle(self):
+        # partition 1 has published data (high=4), no committed offset, and
+        # nothing consumed yet: it must NOT settle
+        frontier = FakeFrontier(150)
+        consumer = FakeConsumer(
+            [FakeMessage(make_event(100, 0))], high_watermarks={0: 1, 1: 4}
+        )
+        writer = RecordingWriter()
+        sink = make_sink(consumer, writer, frontier, partitions=(0, 1))
+        sink.run_iteration()
+        sink.run_iteration()
+        assert writer.transactions == []
+
     def test_frontier_does_not_settle_partition_with_unread_data(self):
         # consumer position (0) is behind the high watermark (5): not caught up,
         # so the frontier alone must not settle the partition
@@ -176,6 +240,58 @@ class TestFlushViaFrontier:
         sink.buffer.add(100, __import__("mz_tpuf_sink.models", fromlist=["Upsert"]).Upsert(id=1, row={"id": 1}))
         sink.run_iteration()
         assert writer.transactions == []
+
+
+class TestSettlementThrottling:
+    def test_watermarks_not_probed_per_message_when_frontier_unchanged(self):
+        # frontier below everything: probing repeatedly can never settle more
+        frontier = FakeFrontier(50)
+        consumer = FakeConsumer(
+            [FakeMessage(make_event(100 + i, i, doc=i)) for i in range(5)],
+            high_watermarks={0: 5, 1: 0},
+        )
+        sink = make_sink(consumer, RecordingWriter(), frontier, partitions=(0, 1))
+        sink.run_iteration()
+        probes_after_first = consumer.watermark_calls
+        for _ in range(4):  # busy iterations, frontier unchanged
+            sink.run_iteration()
+        assert consumer.watermark_calls == probes_after_first
+
+    def test_probes_again_when_frontier_advances(self):
+        frontier = FakeFrontier(50)
+        consumer = FakeConsumer(
+            [FakeMessage(make_event(100, 0)), FakeMessage(make_event(200, 1))],
+            high_watermarks={0: 2, 1: 0},
+        )
+        sink = make_sink(consumer, RecordingWriter(), frontier, partitions=(0, 1))
+        sink.run_iteration()
+        sink.run_iteration()
+        before = consumer.watermark_calls
+        frontier.value = 300
+        sink.run_iteration()
+        assert consumer.watermark_calls > before
+
+
+class TestNoOpTransactions:
+    def test_offsets_committed_for_ts_with_no_effective_ops(self):
+        # a timestamp whose every event is a no-change update produces no
+        # write, but its offsets must still be committed once complete
+        no_change = ChangeEvent(
+            key={"id": 1},
+            before={"id": 1, "v": 9},
+            after={"id": 1, "v": 9},
+            ts=100,
+            partition=0,
+            offset=0,
+        )
+        frontier = FakeFrontier(150)
+        consumer = FakeConsumer([FakeMessage(no_change)], high_watermarks={0: 1})
+        writer = RecordingWriter()
+        sink = make_sink(consumer, writer, frontier)
+        sink.run_iteration()
+        sink.run_iteration()
+        assert writer.transactions == []
+        assert consumer.commits == [[TopicPartition(TOPIC, 0, 1)]]
 
 
 class TestBackpressure:
